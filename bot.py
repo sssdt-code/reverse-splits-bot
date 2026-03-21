@@ -26,11 +26,12 @@ POLL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "600"))
 FEEDS = [
     ("GlobeNewswire", "https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies"),
     ("PR Newswire", "https://www.prnewswire.com/rss/news-releases-list.rss"),
-    ("BusinessWire", "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFJ5WnA="),
+    ("BusinessWire", "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFJXkJeEFJ5WnA="),
     ("Nasdaq Trader", "https://www.nasdaqtrader.com/rss.aspx?feed=currentheadlines&categorylist=1"),
 ]
 
 SPLITS_CALENDAR_URL = "https://stockanalysis.com/actions/splits/"
+
 HEADERS = {
     "User-Agent": os.getenv("SEC_USER_AGENT", "Sergey Zinin your_email@example.com")
 }
@@ -47,8 +48,8 @@ STRICT_RS_PHRASES = [
     "stock consolidation",
 ]
 
-RATIO_TEXT_RE = re.compile(r"\\b1\\s*[-:]?\\s*for\\s*[-:]?\\s*(\\d+)\\b", re.IGNORECASE)
-TICKER_RE = re.compile(r"\\b[A-Z]{1,5}\\b")
+RATIO_TEXT_RE = re.compile(r"\b1\s*[-:]?\s*for\s*[-:]?\s*(\d+)\b", re.IGNORECASE)
+TICKER_RE = re.compile(r"\b[A-Z]{1,5}\b")
 
 
 def clean_text(value: str) -> str:
@@ -125,12 +126,12 @@ async def scan_feed(client: httpx.AsyncClient, source_name: str, feed_url: str, 
         summary = clean_text(entry.get("summary", "") or entry.get("description", ""))
         link = entry.get("link", "")
 
-        text = f"{title}\\n{summary}"
+        text = f"{title}\n{summary}"
         ratio = extract_ratio_if_strict(text)
 
         if ratio is None:
             body = await fetch_page_text(client, link)
-            text = f"{text}\\n{body}"
+            text = f"{text}\n{body}"
         else:
             body = ""
 
@@ -192,7 +193,7 @@ def parse_calendar_date(text: str) -> str | None:
 
 def normalize_calendar_ratio(text: str) -> str:
     t = " ".join(text.strip().split()).lower()
-    m = re.search(r"(\\d+)\\s+for\\s+(\\d+)", t)
+    m = re.search(r"(\d+)\s+for\s+(\d+)", t)
     if not m:
         return text.strip()
     left = m.group(1)
@@ -269,7 +270,7 @@ def format_date_list(title: str, target_date: str, items: list[dict]) -> str:
     lines = [f"{title} {target_date}:"]
     for item in items:
         lines.append(f"{item['ticker']} | {item['ratio']} | {item['company']}")
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 
 def format_grouped(title: str, items: list[dict]) -> str:
@@ -281,10 +282,21 @@ def format_grouped(title: str, items: list[dict]) -> str:
     for item in items:
         if item["effective_date"] != current_date:
             current_date = item["effective_date"]
-            lines.append(f"")
+            lines.append("")
             lines.append(f"📅 {current_date}")
         lines.append(f"{item['ticker']} | {item['ratio']} | {item['company']}")
-    return "\\n".join(lines)
+    return "\n".join(lines)
+
+
+def format_calendar_push(item: dict) -> str:
+    return (
+        "📅 NEW UPCOMING REVERSE SPLIT\n\n"
+        f"Ticker: {item['ticker']}\n"
+        f"Ratio: {item['ratio']}\n"
+        f"Effective date: {item['effective_date']}\n"
+        f"Company: {item['company']}\n"
+        f"Source: {item['source']}"
+    )
 
 
 async def send(bot, text: str) -> None:
@@ -292,34 +304,64 @@ async def send(bot, text: str) -> None:
 
 
 async def scanner_loop(app: Application) -> None:
-    sent = set()
+    sent_news = set()
+    sent_calendar = set()
 
     async with httpx.AsyncClient(headers=HEADERS) as client:
         allowed_symbols = await load_allowed_symbols(client)
 
     app.bot_data["allowed_symbols"] = allowed_symbols
 
+    try:
+        initial_calendar = await fetch_calendar_all(allowed_symbols)
+        for item in initial_calendar:
+            key = f'{item["ticker"]}|{item["ratio"]}|{item["effective_date"]}'
+            sent_calendar.add(key)
+        logging.info("Seeded calendar cache with %s items", len(sent_calendar))
+    except Exception as e:
+        logging.warning("Failed to seed calendar cache: %s", e)
+
     while True:
         try:
             alerts = await scan_all_sources(allowed_symbols)
-            logging.info("Total matching alerts this cycle: %s", len(alerts))
+            logging.info("Total matching news alerts this cycle: %s", len(alerts))
 
             for item in alerts:
                 key = f'{item["ticker"]}|{item["ratio"]}|{item["link"]}'
-                if key in sent:
+                if key in sent_news:
                     continue
-                sent.add(key)
+                sent_news.add(key)
 
                 msg = (
-                    f"🚨 RS ALERT\\n\\n"
-                    f"Ticker: {item['ticker']}\\n"
-                    f"Ratio: {item['ratio']}\\n"
-                    f"Source: {item['source']}\\n"
-                    f"Title: {item['title']}\\n"
+                    f"🚨 RS ALERT\n\n"
+                    f"Ticker: {item['ticker']}\n"
+                    f"Ratio: {item['ratio']}\n"
+                    f"Source: {item['source']}\n"
+                    f"Title: {item['title']}\n"
                     f"Link: {item['link']}"
                 )
-                logging.info("Sending alert: %s %s from %s", item["ticker"], item["ratio"], item["source"])
+                logging.info("Sending news alert: %s %s from %s", item["ticker"], item["ratio"], item["source"])
                 await send(app.bot, msg)
+
+            calendar_items = await fetch_calendar_all(allowed_symbols)
+            logging.info("Calendar items fetched: %s", len(calendar_items))
+
+            today = datetime.now().strftime("%Y-%m-%d")
+            future_calendar_items = [x for x in calendar_items if x["effective_date"] >= today]
+
+            new_calendar_items = []
+            for item in future_calendar_items:
+                key = f'{item["ticker"]}|{item["ratio"]}|{item["effective_date"]}'
+                if key in sent_calendar:
+                    continue
+                sent_calendar.add(key)
+                new_calendar_items.append(item)
+
+            logging.info("New calendar items this cycle: %s", len(new_calendar_items))
+
+            for item in new_calendar_items:
+                logging.info("Sending calendar push: %s %s %s", item["ticker"], item["ratio"], item["effective_date"])
+                await send(app.bot, format_calendar_push(item))
 
         except Exception as e:
             logging.exception("Scanner loop error: %s", e)
@@ -349,8 +391,8 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Status: running\\n"
-        f"Sources: {len(FEEDS)} news feeds + calendar\\n"
+        "Status: running\n"
+        f"Sources: {len(FEEDS)} news feeds + calendar\n"
         f"Poll interval: {POLL_SECONDS} sec"
     )
 
@@ -368,7 +410,6 @@ async def cmd_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     allowed_symbols = await ensure_allowed_symbols(context.application)
-    await update.message.reply_text(f"Ищу upcoming reverse splits на {target_date}...")
     items = await fetch_calendar_all(allowed_symbols)
     items = filter_by_date(items, target_date)
     await update.message.reply_text(format_date_list("📅 Upcoming reverse splits на", target_date, items))
@@ -401,32 +442,26 @@ async def cmd_t1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     allowed_symbols = await ensure_allowed_symbols(context.application)
     items = await fetch_calendar_all(allowed_symbols)
-
     today = datetime.now().strftime("%Y-%m-%d")
     items = [x for x in items if x["effective_date"] >= today]
-
     await update.message.reply_text(format_grouped("📋 Все upcoming reverse splits", items[:100]))
 
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     start_date = datetime.now().strftime("%Y-%m-%d")
     end_date = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
-
     allowed_symbols = await ensure_allowed_symbols(context.application)
     items = await fetch_calendar_all(allowed_symbols)
     items = filter_range(items, start_date, end_date)
-
     await update.message.reply_text(format_grouped("📆 Reverse splits на 7 дней", items))
 
 
 async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     start_date = datetime.now().strftime("%Y-%m-%d")
     end_date = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
-
     allowed_symbols = await ensure_allowed_symbols(context.application)
     items = await fetch_calendar_all(allowed_symbols)
     items = filter_range(items, start_date, end_date)
-
     await update.message.reply_text(format_grouped("🗓 Reverse splits на 30 дней", items[:150]))
 
 
