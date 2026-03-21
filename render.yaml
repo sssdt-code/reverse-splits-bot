@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: reverse-splits-bot
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHAT_ID
+        sync: false
+      - key: POLL_INTERVAL_SECONDS
+        value: "600"
+      - key: SEC_USER_AGENT
+        sync: false
