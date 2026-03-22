@@ -3,7 +3,7 @@ import json
 import logging
 import asyncio
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 import httpx
 import gspread
@@ -195,88 +195,14 @@ async def get_price_now(ticker: str) -> str:
         return "N/A"
 
 
-async def get_history_prices(ticker: str, ref_date_str: str) -> tuple[str, str]:
-    if not ref_date_str or ref_date_str == "N/A":
-        return "N/A", "N/A"
-
-    try:
-        ref_dt = datetime.strptime(ref_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    except Exception:
-        return "N/A", "N/A"
-
-    start_dt = ref_dt - timedelta(days=30)
-    end_dt = ref_dt + timedelta(days=2)
-
-    period1 = int(start_dt.timestamp())
-    period2 = int(end_dt.timestamp())
-
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-    params = {
-        "period1": str(period1),
-        "period2": str(period2),
-        "interval": "1d",
-        "includePrePost": "false",
-        "events": "div,splits",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
-            r = await client.get(url, params=params)
-            r.raise_for_status()
-            data = r.json()
-
-        result = data.get("chart", {}).get("result", [])
-        if not result:
-            return "N/A", "N/A"
-
-        timestamps = result[0].get("timestamp", [])
-        quote = result[0].get("indicators", {}).get("quote", [{}])[0]
-        closes = quote.get("close", [])
-
-        rows = []
-        for ts, close in zip(timestamps, closes):
-            if close is None:
-                continue
-            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-            rows.append((dt, float(close)))
-
-        if not rows:
-            return "N/A", "N/A"
-
-        target_14d = ref_dt - timedelta(days=14)
-
-        close_pre = "N/A"
-        pre_candidates = [price for dt, price in rows if dt < ref_dt]
-        if pre_candidates:
-            close_pre = f"{pre_candidates[-1]:.2f}"
-
-        close_14d = "N/A"
-        hist_candidates = [(dt, price) for dt, price in rows if dt <= target_14d]
-        if hist_candidates:
-            close_14d = f"{hist_candidates[-1][1]:.2f}"
-        else:
-            earlier = [(dt, price) for dt, price in rows if dt < ref_dt]
-            if earlier:
-                close_14d = f"{earlier[0][1]:.2f}"
-
-        return close_14d, close_pre
-
-    except Exception as e:
-        logging.warning("History fetch failed for %s: %s", ticker, e)
-        return "N/A", "N/A"
-
-
 async def build_rows(items: list[dict]) -> list[list[str]]:
     rows = []
 
     for index, item in enumerate(items, start=1):
         ticker = item["ticker"]
 
-        close_14d, close_pre = await get_history_prices(ticker, item["announcement_date"])
-        await asyncio.sleep(1.5)
-
         price_now = await get_price_now(ticker)
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(2.0)
 
         rows.append([
             item["ticker"],
@@ -285,15 +211,15 @@ async def build_rows(items: list[dict]) -> list[list[str]]:
             item["split_date"],
             item["ratio"],
             item["exchange"],
-            close_14d,
-            close_pre,
+            "N/A",
+            "N/A",
             price_now,
             item["source"],
         ])
 
         logging.info(
-            "Prepared row %s/%s for %s | close_14d=%s close_pre=%s price_now=%s",
-            index, len(items), ticker, close_14d, close_pre, price_now
+            "Prepared row %s/%s for %s | price_now=%s",
+            index, len(items), ticker, price_now
         )
 
     return rows
