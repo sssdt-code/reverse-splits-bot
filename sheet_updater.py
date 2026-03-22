@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY", "").strip()
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "splits_feed").strip()
-GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS", "")
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS", "").strip()
 POLL_INTERVAL = int(os.getenv("SHEET_POLL_INTERVAL_SECONDS", "600"))
 
 BENZINGA_URL = "https://www.benzinga.com/calendars/stock-splits"
@@ -42,6 +42,7 @@ DATE_FORMATS = (
     "%B %d, %Y",
 )
 
+VALID_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "ARCA", "BATS", "OTC"}
 EXCLUDED_EXCHANGES = {"OTC"}
 BAD_COMPANY_WORDS = {"ETF", "DEFIANCE"}
 
@@ -144,13 +145,13 @@ def parse_benzinga_html(html_text: str):
 
         exchange = ""
         for c in upper_cells:
-            if c in {"NASDAQ", "NYSE", "AMEX", "ARCA", "BATS", "OTC"}:
+            if c in VALID_EXCHANGES:
                 exchange = c
                 break
 
         ticker = ""
         for c in upper_cells:
-            if c in {"NASDAQ", "NYSE", "AMEX", "ARCA", "BATS", "OTC"}:
+            if c in VALID_EXCHANGES:
                 continue
             if looks_like_ticker(c):
                 ticker = c
@@ -180,18 +181,18 @@ def parse_benzinga_html(html_text: str):
             continue
 
         parsed.append([
-            ticker,          # A
-            company,         # B
-            announcement_date,  # C
-            split_date,      # D
-            ratio,           # E
-            exchange,        # F
-            "",              # G Close -14D
-            "",              # H Close Pre
-            "",              # I Price Now
-            "",              # J formula
-            "",              # K formula
-            "Benzinga",      # L
+            ticker,            # A
+            company,           # B
+            announcement_date, # C
+            split_date,        # D
+            ratio,             # E
+            exchange,          # F
+            "",                # G Close -14D
+            "",                # H Close Pre
+            "",                # I Price Now
+            "",                # J % vs Close -14D
+            "",                # K % vs Close Pre
+            "Benzinga",        # L Source
         ])
 
     dedup = []
@@ -223,7 +224,7 @@ async def twelve_series(client: httpx.AsyncClient, ticker: str, announcement_dat
     try:
         ann_dt = datetime.strptime(announcement_date, "%Y-%m-%d") if announcement_date else datetime.utcnow()
 
-        start = (ann_dt - timedelta(days=30)).date()
+        start = (ann_dt - timedelta(days=40)).date()
         end = datetime.utcnow().date()
 
         r = await client.get(
@@ -233,12 +234,18 @@ async def twelve_series(client: httpx.AsyncClient, ticker: str, announcement_dat
                 "interval": "1day",
                 "start_date": str(start),
                 "end_date": str(end),
-                "outputsize": 60,
+                "outputsize": 100,
                 "apikey": TWELVE_API_KEY,
             },
             timeout=20,
         )
+
         data = r.json()
+
+        if "values" not in data:
+            logging.warning("%s: no values in response -> %s", ticker, data)
+            return None, None, None
+
         values = data.get("values", [])
         if not values:
             return None, None, None
@@ -247,11 +254,10 @@ async def twelve_series(client: httpx.AsyncClient, ticker: str, announcement_dat
         for row in values:
             dt_raw = row.get("datetime") or row.get("date")
             close = row.get("close")
-            if not dt_raw or close is None:
+            if not dt_raw or close in (None, "", "null"):
                 continue
             try:
-                dt = datetime.strptime(dt_raw[:10], "%Y-%m-%d")
-                parsed.append((dt, float(close)))
+                parsed.append((datetime.strptime(dt_raw[:10], "%Y-%m-%d"), float(close)))
             except Exception:
                 continue
 
@@ -263,22 +269,23 @@ async def twelve_series(client: httpx.AsyncClient, ticker: str, announcement_dat
         price_now = parsed[-1][1]
 
         close_pre = None
-        pre_candidates = [p for d, p in parsed if d < ann_dt]
-        if pre_candidates:
-            close_pre = pre_candidates[-1]
+        before = [p for d, p in parsed if d < ann_dt]
+        if before:
+            close_pre = before[-1]
 
         target = ann_dt - timedelta(days=14)
+        hist = [p for d, p in parsed if d <= target]
+
         close_14d = None
-        hist_candidates = [p for d, p in parsed if d <= target]
-        if hist_candidates:
-            close_14d = hist_candidates[-1]
-        elif pre_candidates:
-            close_14d = pre_candidates[0]
+        if hist:
+            close_14d = hist[-1]
+        elif before:
+            close_14d = before[0]
 
         return price_now, close_pre, close_14d
 
     except Exception as e:
-        logging.warning("Time series failed for %s: %s", ticker, e)
+        logging.warning("%s: series error -> %s", ticker, e)
         return None, None, None
 
 
@@ -290,14 +297,12 @@ async def enrich_rows(rows):
 
             price_now, close_pre, close_14d = await twelve_series(client, ticker, announcement_date)
 
-            # Пишем ЧИСЛА, а не строки
             row[6] = round(close_14d, 4) if close_14d is not None else ""
             row[7] = round(close_pre, 4) if close_pre is not None else ""
             row[8] = round(price_now, 4) if price_now is not None else ""
 
-            sheet_row = i + 1  # строка на листе, потому что header = 1
+            sheet_row = i + 1
 
-            # Формулы с русской локалью (;)
             row[9] = f'=IF(OR(G{sheet_row}="";I{sheet_row}="";G{sheet_row}=0);"";I{sheet_row}/G{sheet_row}-1)'
             row[10] = f'=IF(OR(H{sheet_row}="";I{sheet_row}="";H{sheet_row}=0);"";I{sheet_row}/H{sheet_row}-1)'
 
@@ -315,16 +320,14 @@ def apply_formatting(sheet, row_count: int):
     last_row = max(row_count, 2)
 
     try:
-        # Заголовки
         sheet.format(
-            f"A1:L1",
+            "A1:L1",
             {
                 "textFormat": {"bold": True},
                 "horizontalAlignment": "CENTER"
             }
         )
 
-        # Числовой формат для цен
         sheet.format(
             f"G2:I{last_row}",
             {
@@ -335,7 +338,6 @@ def apply_formatting(sheet, row_count: int):
             }
         )
 
-        # Проценты
         sheet.format(
             f"J2:K{last_row}",
             {
@@ -352,7 +354,11 @@ def apply_formatting(sheet, row_count: int):
 def rewrite_sheet(sheet, rows):
     values = [HEADERS] + rows
     sheet.clear()
-    sheet.update("A1:L" + str(len(values)), values, value_input_option="USER_ENTERED")
+    sheet.update(
+        range_name=f"A1:L{len(values)}",
+        values=values,
+        value_input_option="USER_ENTERED"
+    )
     apply_formatting(sheet, len(values))
     logging.info("Sheet updated with %s rows", len(rows))
 
