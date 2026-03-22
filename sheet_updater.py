@@ -2,7 +2,6 @@ import os
 import json
 import logging
 import asyncio
-import re
 from datetime import datetime, timedelta
 
 import httpx
@@ -10,369 +9,142 @@ import gspread
 from bs4 import BeautifulSoup
 from oauth2client.service_account import ServiceAccountCredentials
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(level=logging.INFO)
 
-TWELVE_API_KEY = os.getenv("TWELVE_API_KEY", "").strip()
-FMP_API_KEY = os.getenv("FMP_API_KEY", "").strip()
-SHEET_ID = os.getenv("SHEET_ID", "").strip()
-WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "splits_feed").strip()
-POLL_INTERVAL = int(os.getenv("SHEET_POLL_INTERVAL_SECONDS", "600"))
-
-BENZINGA_URL = "https://www.benzinga.com/calendars/stock-splits"
+TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
+FMP_API_KEY = os.getenv("FMP_API_KEY")
+SHEET_ID = os.getenv("SHEET_ID")
+WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "splits_feed")
 
 HEADERS = [
-    "Ticker",
-    "Company",
-    "Announcement Date",
-    "Split Date",
-    "Ratio",
-    "Exchange",
-    "Close -14D",
-    "Close Pre",
-    "Price Now",
-    "Source",
+    "Ticker","Company","Announcement Date","Split Date",
+    "Ratio","Exchange","Close -14D","Close Pre","Price Now","Source"
 ]
 
-EXCLUDED_EXCHANGES = {"OTC"}
+BAD_WORDS = ["ETF", "Defiance", "2X", "3X"]
 
-# Исправления для кривых строк
-TICKER_OVERRIDES = {
-    "JIADE": "JDZG",
-    "TUNIU": "TOUR",
-    "SANRIO": "SNROF",
-}
+def connect():
+    creds = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+    scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds, scope)
+    return gspread.authorize(creds).open_by_key(SHEET_ID).worksheet(WORKSHEET_NAME)
 
-DATE_FORMATS = (
-    "%m/%d/%Y",
-    "%Y-%m-%d",
-    "%b %d, %Y",
-    "%B %d, %Y",
-)
-
-
-def connect_sheet():
-    creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    client = gspread.authorize(creds)
-    return client.open_by_key(SHEET_ID).worksheet(WORKSHEET_NAME)
-
-
-def normalize_date(value: str) -> str:
-    value = (value or "").strip()
-    for fmt in DATE_FORMATS:
-        try:
-            return datetime.strptime(value, fmt).strftime("%Y-%m-%d")
-        except Exception:
-            pass
-    return value
-
-
-def is_date_like(value: str) -> bool:
-    value = (value or "").strip()
-    for fmt in DATE_FORMATS:
-        try:
-            datetime.strptime(value, fmt)
-            return True
-        except Exception:
-            pass
-    return False
-
-
-def looks_like_ratio(value: str) -> bool:
-    v = (value or "").strip().lower().replace(" ", "")
-    return ("for" in v or ":" in v) and any(ch.isdigit() for ch in v)
-
-
-def normalize_ratio(value: str) -> str:
-    v = (value or "").strip()
-    v = v.replace(":", "-for-")
-    v = re.sub(r"\s+[Ff]or\s+", "-for-", v)
-    v = re.sub(r"\s+", "", v)
-    return v
-
-
-def looks_like_ticker(value: str) -> bool:
-    v = (value or "").strip().upper()
-    return 1 <= len(v) <= 6 and v.isalpha()
-
-
-def is_good_stock(ticker: str, company: str, exchange: str) -> bool:
-    name = (company or "").lower()
-
-    if exchange in EXCLUDED_EXCHANGES:
+def valid_stock(ticker, company, exchange):
+    if exchange == "OTC":
         return False
-    if "etf" in name:
+    if any(w.lower() in company.lower() for w in BAD_WORDS):
         return False
-    if "defiance" in name:
+    if len(ticker) > 5:
         return False
-
     return True
 
-
-def parse_benzinga_html(html_text: str):
-    soup = BeautifulSoup(html_text, "html.parser")
-
+def parse(html):
+    soup = BeautifulSoup(html, "html.parser")
     rows = []
+
     for tr in soup.find_all("tr"):
-        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-        if len(cells) >= 6:
-            rows.append(cells)
-
-    parsed = []
-    for cells in rows:
-        joined = " | ".join(cells).lower()
-        if "split date" in joined and "ticker" in joined:
+        tds = [x.get_text(strip=True) for x in tr.find_all("td")]
+        if len(tds) < 5:
             continue
 
-        date_cells = [normalize_date(c) for c in cells if is_date_like(c)]
-        if not date_cells:
+        ticker = tds[0].upper()
+        company = tds[1]
+        ann = tds[2]
+        split = tds[3]
+        ratio = tds[4]
+        exchange = tds[5] if len(tds) > 5 else ""
+
+        if not valid_stock(ticker, company, exchange):
             continue
 
-        split_date = date_cells[0]
-        announcement_date = date_cells[1] if len(date_cells) > 1 else ""
-
-        ratio_candidates = [c for c in cells if looks_like_ratio(c)]
-        if not ratio_candidates:
-            continue
-        ratio = normalize_ratio(ratio_candidates[0])
-
-        upper_cells = [c.strip().upper() for c in cells]
-
-        exchange = ""
-        for c in upper_cells:
-            if c in {"NASDAQ", "NYSE", "AMEX", "ARCA", "BATS", "OTC"}:
-                exchange = c
-                break
-
-        ticker = ""
-        for c in upper_cells:
-            if c in {"NASDAQ", "NYSE", "AMEX", "ARCA", "BATS", "OTC"}:
-                continue
-            if looks_like_ticker(c):
-                ticker = c
-                break
-
-        company = ""
-        company_candidates = []
-        for c in cells:
-            cu = c.strip().upper()
-            if cu == ticker or cu == exchange:
-                continue
-            if is_date_like(c) or looks_like_ratio(c):
-                continue
-            if len(c.strip()) > 2:
-                company_candidates.append(c.strip())
-
-        if company_candidates:
-            company = company_candidates[0]
-
-        if not ticker or not company or not split_date or not ratio:
-            continue
-
-        if ticker in TICKER_OVERRIDES:
-            ticker = TICKER_OVERRIDES[ticker]
-
-        if not is_good_stock(ticker, company, exchange):
-            continue
-
-        parsed.append([
-            ticker,
-            company,
-            announcement_date,
-            split_date,
-            ratio,
-            exchange,
-            "N/A",
-            "N/A",
-            "N/A",
-            "Benzinga",
+        rows.append([
+            ticker, company, ann, split, ratio, exchange,
+            "N/A","N/A","N/A","Benzinga"
         ])
-
-    dedup = []
-    seen = set()
-    for row in parsed:
-        key = (row[0], row[3], row[4], row[5])
-        if key in seen:
-            continue
-        seen.add(key)
-        dedup.append(row)
-
-    dedup.sort(key=lambda x: (x[3], x[0]))
-    return dedup
-
-
-async def fetch_splits():
-    async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-        r = await client.get(
-            BENZINGA_URL,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        r.raise_for_status()
-        rows = parse_benzinga_html(r.text)
-        logging.info("Parsed splits: %s", len(rows))
-        return rows
-
-
-async def get_price_now(client: httpx.AsyncClient, ticker: str) -> str:
-    # Twelve first
-    if TWELVE_API_KEY:
-        try:
-            r = await client.get(
-                "https://api.twelvedata.com/price",
-                params={"symbol": ticker, "apikey": TWELVE_API_KEY},
-                timeout=15,
-            )
-            data = r.json()
-            price = data.get("price")
-            if price and str(price).lower() != "null":
-                return str(price)
-        except Exception as e:
-            logging.warning("Twelve price failed for %s: %s", ticker, e)
-
-    # FMP fallback
-    if FMP_API_KEY:
-        try:
-            r = await client.get(
-                f"https://financialmodelingprep.com/api/v3/quote/{ticker}",
-                params={"apikey": FMP_API_KEY},
-                timeout=15,
-            )
-            data = r.json()
-            if isinstance(data, list) and data:
-                price = data[0].get("price")
-                if price is not None:
-                    return str(price)
-        except Exception as e:
-            logging.warning("FMP quote failed for %s: %s", ticker, e)
-
-        try:
-            r = await client.get(
-                f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}",
-                params={"apikey": FMP_API_KEY},
-                timeout=15,
-            )
-            data = r.json()
-            hist = data.get("historical", [])
-            if hist:
-                price = hist[0].get("close")
-                if price is not None:
-                    return str(price)
-        except Exception as e:
-            logging.warning("FMP historical fallback failed for %s: %s", ticker, e)
-
-    return "N/A"
-
-
-async def get_history_prices(client: httpx.AsyncClient, ticker: str, announcement_date: str):
-    if not FMP_API_KEY or not announcement_date:
-        return "N/A", "N/A"
-
-    try:
-        ann_dt = datetime.strptime(announcement_date, "%Y-%m-%d")
-    except Exception:
-        return "N/A", "N/A"
-
-    try:
-        r = await client.get(
-            f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}",
-            params={"apikey": FMP_API_KEY},
-            timeout=20,
-        )
-        data = r.json()
-        hist = data.get("historical", [])
-        if not hist:
-            return "N/A", "N/A"
-
-        parsed = []
-        for row in hist:
-            d = row.get("date")
-            c = row.get("close")
-            if not d or c is None:
-                continue
-            try:
-                parsed.append((datetime.strptime(d, "%Y-%m-%d"), float(c)))
-            except Exception:
-                continue
-
-        if not parsed:
-            return "N/A", "N/A"
-
-        parsed.sort(key=lambda x: x[0])
-
-        close_pre = "N/A"
-        pre_candidates = [p for d, p in parsed if d < ann_dt]
-        if pre_candidates:
-            close_pre = f"{pre_candidates[-1]:.4f}"
-
-        target = ann_dt - timedelta(days=14)
-        close_14d = "N/A"
-        hist_candidates = [p for d, p in parsed if d <= target]
-        if hist_candidates:
-            close_14d = f"{hist_candidates[-1]:.4f}"
-        elif pre_candidates:
-            close_14d = f"{pre_candidates[0]:.4f}"
-
-        return close_14d, close_pre
-
-    except Exception as e:
-        logging.warning("History failed for %s: %s", ticker, e)
-        return "N/A", "N/A"
-
-
-async def enrich_rows(rows):
-    async with httpx.AsyncClient() as client:
-        for i, row in enumerate(rows, start=1):
-            ticker = row[0]
-            announcement_date = row[2]
-
-            close_14d, close_pre = await get_history_prices(client, ticker, announcement_date)
-            await asyncio.sleep(0.4)
-
-            price_now = await get_price_now(client, ticker)
-            await asyncio.sleep(0.6)
-
-            row[6] = close_14d
-            row[7] = close_pre
-            row[8] = price_now
-
-            logging.info(
-                "Prepared row %s/%s for %s | close_14d=%s close_pre=%s price_now=%s",
-                i, len(rows), ticker, close_14d, close_pre, price_now
-            )
 
     return rows
 
+async def fetch_splits():
+    async with httpx.AsyncClient() as c:
+        r = await c.get("https://www.benzinga.com/calendars/stock-splits")
+        return parse(r.text)
 
-def rewrite_sheet(sheet, rows):
-    values = [HEADERS] + rows
+async def price_now(c, ticker):
+    try:
+        r = await c.get("https://api.twelvedata.com/price",
+            params={"symbol": ticker, "apikey": TWELVE_API_KEY})
+        p = r.json().get("price")
+        if p:
+            return p
+    except:
+        pass
+
+    try:
+        r = await c.get(f"https://financialmodelingprep.com/api/v3/quote/{ticker}",
+            params={"apikey": FMP_API_KEY})
+        data = r.json()
+        if data:
+            return data[0].get("price","N/A")
+    except:
+        pass
+
+    return "N/A"
+
+async def history(c, ticker, ann):
+    try:
+        ann = datetime.strptime(ann, "%Y-%m-%d")
+    except:
+        return "N/A","N/A"
+
+    try:
+        r = await c.get(
+            f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}",
+            params={"apikey": FMP_API_KEY}
+        )
+        hist = r.json().get("historical", [])
+
+        if not hist:
+            return "N/A","N/A"
+
+        close_pre = hist[0]["close"]
+        close_14d = hist[min(14, len(hist)-1)]["close"]
+
+        return close_14d, close_pre
+
+    except:
+        return "N/A","N/A"
+
+async def enrich(rows):
+    async with httpx.AsyncClient() as c:
+        for i, r in enumerate(rows):
+            ticker = r[0]
+
+            p = await price_now(c, ticker)
+            h14, hp = await history(c, ticker, r[2])
+
+            r[6] = h14
+            r[7] = hp
+            r[8] = p
+
+            logging.info(f"{i+1}/{len(rows)} {ticker} price={p}")
+
+            await asyncio.sleep(0.5)
+
+    return rows
+
+def update(sheet, rows):
     sheet.clear()
-    sheet.update("A1", values)
-    logging.info("Sheet updated with %s rows", len(rows))
+    sheet.update("A1", [HEADERS] + rows)
 
-
-async def main_loop():
-    sheet = connect_sheet()
+async def main():
+    sheet = connect()
 
     while True:
-        try:
-            rows = await fetch_splits()
+        rows = await fetch_splits()
+        rows = await enrich(rows)
+        update(sheet, rows)
 
-            if rows:
-                rows = await enrich_rows(rows)
-                rewrite_sheet(sheet, rows)
-            else:
-                logging.warning("No splits parsed; keeping previous sheet untouched")
+        logging.info("DONE. Sleep 600s")
+        await asyncio.sleep(600)
 
-        except Exception as e:
-            logging.exception("Updater error: %s", e)
-
-        logging.info("Sleeping %s seconds...", POLL_INTERVAL)
-        await asyncio.sleep(POLL_INTERVAL)
-
-
-if __name__ == "__main__":
-    asyncio.run(main_loop())
+asyncio.run(main())
