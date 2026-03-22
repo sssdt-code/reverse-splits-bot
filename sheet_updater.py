@@ -2,7 +2,8 @@ import os
 import json
 import logging
 import asyncio
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 
 import httpx
 import gspread
@@ -31,6 +32,26 @@ HEADERS = [
     "Source",
 ]
 
+EXCLUDED_EXCHANGES = {"OTC"}
+
+# Явные правки для случаев, где Benzinga местами путает компанию и тикер
+TICKER_OVERRIDES = {
+    "JIADE": "JDZG",
+    "TUNIU": "TOUR",
+    "SANRIO": "SNROF",
+}
+
+PREFERRED_US_EXCHANGES = {
+    "NASDAQ", "NYSE", "AMEX", "ARCA", "BATS"
+}
+
+DATE_FORMATS = (
+    "%m/%d/%Y",
+    "%Y-%m-%d",
+    "%b %d, %Y",
+    "%B %d, %Y",
+)
+
 
 def connect_sheet():
     creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
@@ -45,7 +66,7 @@ def connect_sheet():
 
 def normalize_date(value: str) -> str:
     value = (value or "").strip()
-    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%b %d, %Y", "%B %d, %Y"):
+    for fmt in DATE_FORMATS:
         try:
             return datetime.strptime(value, fmt).strftime("%Y-%m-%d")
         except Exception:
@@ -55,7 +76,7 @@ def normalize_date(value: str) -> str:
 
 def is_date_like(value: str) -> bool:
     value = (value or "").strip()
-    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%b %d, %Y", "%B %d, %Y"):
+    for fmt in DATE_FORMATS:
         try:
             datetime.strptime(value, fmt)
             return True
@@ -70,9 +91,16 @@ def looks_like_ratio(value: str) -> bool:
 
 
 def normalize_ratio(value: str) -> str:
-    v = (value or "").strip().replace(":", "-for-").replace(" for ", "-for-").replace(" For ", "-for-")
-    v = v.replace(" ", "")
+    v = (value or "").strip()
+    v = v.replace(":", "-for-")
+    v = re.sub(r"\s+[Ff]or\s+", "-for-", v)
+    v = re.sub(r"\s+", "", v)
     return v
+
+
+def looks_like_ticker(value: str) -> bool:
+    v = (value or "").strip().upper()
+    return 1 <= len(v) <= 6 and v.isalpha()
 
 
 def parse_benzinga_table(html_text: str):
@@ -90,42 +118,35 @@ def parse_benzinga_table(html_text: str):
         if "split date" in joined and "ticker" in joined:
             continue
 
-        split_date = None
-        announcement_date = None
-        ticker = None
-        company = None
-        exchange = None
-        ratio = None
-
-        for cell in cells:
-            if not split_date and is_date_like(cell):
-                split_date = normalize_date(cell)
-                continue
-
         date_cells = [normalize_date(c) for c in cells if is_date_like(c)]
-        if len(date_cells) >= 2:
-            split_date = date_cells[0]
-            announcement_date = date_cells[1]
-        elif len(date_cells) == 1:
-            split_date = date_cells[0]
-            announcement_date = ""
+        if not date_cells:
+            continue
+
+        split_date = date_cells[0]
+        announcement_date = date_cells[1] if len(date_cells) > 1 else ""
 
         ratio_candidates = [c for c in cells if looks_like_ratio(c)]
-        if ratio_candidates:
-            ratio = normalize_ratio(ratio_candidates[0])
+        if not ratio_candidates:
+            continue
+        ratio = normalize_ratio(ratio_candidates[0])
 
         upper_cells = [c.strip().upper() for c in cells]
-        for c in upper_cells:
-            if 1 <= len(c) <= 6 and c.isupper() and c.isalpha():
-                if c not in {"NASDAQ", "NYSE", "AMEX", "ARCA", "BATS", "OTC"}:
-                    ticker = c
-                    break
 
+        exchange = ""
         for c in upper_cells:
             if c in {"NASDAQ", "NYSE", "AMEX", "ARCA", "BATS", "OTC"}:
                 exchange = c
                 break
 
+        ticker = ""
+        for c in upper_cells:
+            if c in {"NASDAQ", "NYSE", "AMEX", "ARCA", "BATS", "OTC"}:
+                continue
+            if looks_like_ticker(c):
+                ticker = c
+                break
+
+        company = ""
         company_candidates = []
         for c in cells:
             cu = c.strip().upper()
@@ -139,35 +160,46 @@ def parse_benzinga_table(html_text: str):
         if company_candidates:
             company = company_candidates[0]
 
-        if ticker and company and split_date and ratio:
-            parsed.append([
-                ticker,
-                company,
-                announcement_date or "",
-                split_date,
-                ratio,
-                exchange or "",
-                "N/A",
-                "N/A",
-                "N/A",
-                "Benzinga",
-            ])
+        if not ticker or not company or not split_date or not ratio:
+            continue
+
+        # Исправляем известные кривые строки
+        if ticker in TICKER_OVERRIDES:
+            ticker = TICKER_OVERRIDES[ticker]
+
+        if exchange in EXCLUDED_EXCHANGES:
+            continue
+
+        parsed.append([
+            ticker,
+            company,
+            announcement_date,
+            split_date,
+            ratio,
+            exchange,
+            "N/A",
+            "N/A",
+            "N/A",
+            "Benzinga",
+        ])
 
     dedup = []
     seen = set()
     for row in parsed:
-        key = (row[0], row[3], row[4])
+        key = (row[0], row[3], row[4], row[5])
         if key in seen:
             continue
         seen.add(key)
         dedup.append(row)
 
+    dedup.sort(key=lambda x: (x[3], x[0]))
     return dedup
 
 
 async def get_price_now(client: httpx.AsyncClient, ticker: str) -> str:
     if not TWELVE_API_KEY:
         return "N/A"
+
     try:
         r = await client.get(
             "https://api.twelvedata.com/price",
@@ -184,13 +216,95 @@ async def get_price_now(client: httpx.AsyncClient, ticker: str) -> str:
         return "N/A"
 
 
-async def enrich_prices(rows):
+async def get_history_prices(client: httpx.AsyncClient, ticker: str, announcement_date: str):
+    if not TWELVE_API_KEY or not announcement_date:
+        return "N/A", "N/A"
+
+    try:
+        ann_dt = datetime.strptime(announcement_date, "%Y-%m-%d")
+    except Exception:
+        return "N/A", "N/A"
+
+    # Берем запас по дням, чтобы хватило на 14D даже с выходными
+    start_date = (ann_dt - timedelta(days=45)).strftime("%Y-%m-%d")
+    end_date = ann_dt.strftime("%Y-%m-%d")
+
+    try:
+        r = await client.get(
+            "https://api.twelvedata.com/time_series",
+            params={
+                "symbol": ticker,
+                "interval": "1day",
+                "start_date": start_date,
+                "end_date": end_date,
+                "outputsize": 60,
+                "apikey": TWELVE_API_KEY,
+            },
+            timeout=25,
+        )
+        data = r.json()
+        values = data.get("values", [])
+        if not values:
+            return "N/A", "N/A"
+
+        parsed = []
+        for row in values:
+            dt_raw = row.get("datetime") or row.get("date")
+            close = row.get("close")
+            if not dt_raw or close is None:
+                continue
+            try:
+                dt = datetime.strptime(dt_raw[:10], "%Y-%m-%d")
+                parsed.append((dt, float(close)))
+            except Exception:
+                continue
+
+        if not parsed:
+            return "N/A", "N/A"
+
+        # Twelve обычно отдает от новых к старым, сортируем по возрастанию
+        parsed.sort(key=lambda x: x[0])
+
+        close_pre = "N/A"
+        pre_candidates = [price for dt, price in parsed if dt < ann_dt]
+        if pre_candidates:
+            close_pre = f"{pre_candidates[-1]:.4f}"
+
+        target_14d = ann_dt - timedelta(days=14)
+        close_14d = "N/A"
+        hist_candidates = [price for dt, price in parsed if dt <= target_14d]
+        if hist_candidates:
+            close_14d = f"{hist_candidates[-1]:.4f}"
+        elif pre_candidates:
+            close_14d = f"{pre_candidates[0]:.4f}"
+
+        return close_14d, close_pre
+    except Exception as e:
+        logging.warning("History fetch failed for %s: %s", ticker, e)
+        return "N/A", "N/A"
+
+
+async def enrich_rows(rows):
     async with httpx.AsyncClient() as client:
         for i, row in enumerate(rows, start=1):
             ticker = row[0]
-            row[8] = await get_price_now(client, ticker)
-            logging.info("Prepared row %s/%s for %s | price_now=%s", i, len(rows), ticker, row[8])
-            await asyncio.sleep(1.0)
+            announcement_date = row[2]
+
+            close_14d, close_pre = await get_history_prices(client, ticker, announcement_date)
+            await asyncio.sleep(0.5)
+
+            price_now = await get_price_now(client, ticker)
+            await asyncio.sleep(0.75)
+
+            row[6] = close_14d
+            row[7] = close_pre
+            row[8] = price_now
+
+            logging.info(
+                "Prepared row %s/%s for %s | close_14d=%s close_pre=%s price_now=%s",
+                i, len(rows), ticker, close_14d, close_pre, price_now
+            )
+
     return rows
 
 
@@ -220,7 +334,7 @@ async def main_loop():
             logging.info("Parsed splits: %s", len(rows))
 
             if rows:
-                rows = await enrich_prices(rows)
+                rows = await enrich_rows(rows)
                 rewrite_sheet(sheet, rows)
             else:
                 logging.warning("No splits parsed; keeping previous sheet untouched")
