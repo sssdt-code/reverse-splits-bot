@@ -1,5 +1,6 @@
 cat > news_bot.py <<'EOF'
 import os
+import csv
 import asyncio
 import html
 import logging
@@ -56,6 +57,8 @@ NUMBER_WORDS = {
     "ninety": "90", "hundred": "100",
 }
 
+CSV_FILE = "splits.csv"
+
 
 def clean_text(value: str) -> str:
     if not value:
@@ -94,6 +97,20 @@ def normalize_ratio(text: str) -> str:
         if right:
             return f"1-for-{right}"
 
+    return ""
+
+
+def get_split_type(ratio: str) -> str:
+    try:
+        left, right = ratio.split("-for-")
+        left = float(left)
+        right = float(right)
+        if left < right:
+            return "RS"
+        if left > right:
+            return "FS"
+    except Exception:
+        pass
     return ""
 
 
@@ -144,6 +161,30 @@ async def get_price(ticker: str) -> str:
     except Exception as e:
         logging.warning("Price fetch failed for %s: %s", ticker, e)
         return "N/A"
+
+
+def ensure_csv_exists() -> None:
+    if os.path.isfile(CSV_FILE):
+        return
+
+    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Date", "Ticker", "Ratio", "Type", "Company", "Price"])
+
+
+def write_to_csv(item: dict) -> None:
+    ensure_csv_exists()
+
+    with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            item.get("ticker", ""),
+            item.get("ratio", ""),
+            get_split_type(item.get("ratio", "")),
+            item.get("title", ""),
+            item.get("price", "N/A"),
+        ])
 
 
 async def scan_feed(client: httpx.AsyncClient, source_name: str, url: str) -> list[dict]:
@@ -236,6 +277,8 @@ seen = set()
 
 
 async def loop() -> None:
+    ensure_csv_exists()
+
     while True:
         try:
             items = await fetch_news()
@@ -255,6 +298,7 @@ async def loop() -> None:
                     text=format_alert(item),
                     disable_web_page_preview=False,
                 )
+                write_to_csv(item)
 
         except Exception as e:
             logging.exception("Loop error: %s", e)
