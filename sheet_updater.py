@@ -1,152 +1,378 @@
 import os
-import httpx
+import json
+import logging
 import asyncio
+import re
 from datetime import datetime, timedelta
+
+import httpx
 import gspread
-from google.oauth2.service_account import Credentials
+from bs4 import BeautifulSoup
+from oauth2client.service_account import ServiceAccountCredentials
 
-GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
-SHEET_ID = os.getenv("SHEET_ID")
-WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Split Feed")
-TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
-FMP_API_KEY = os.getenv("FMP_API_KEY")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-HEADERS = ["Ticker","Company","Announcement Date","Split Date","Ratio","Exchange","Close -14D","Close Pre","Price Now","Source"]
+TWELVE_API_KEY = os.getenv("TWELVE_API_KEY", "").strip()
+FMP_API_KEY = os.getenv("FMP_API_KEY", "").strip()
+SHEET_ID = os.getenv("SHEET_ID", "").strip()
+WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "splits_feed").strip()
+POLL_INTERVAL = int(os.getenv("SHEET_POLL_INTERVAL_SECONDS", "600"))
+
+BENZINGA_URL = "https://www.benzinga.com/calendars/stock-splits"
+
+HEADERS = [
+    "Ticker",
+    "Company",
+    "Announcement Date",
+    "Split Date",
+    "Ratio",
+    "Exchange",
+    "Close -14D",
+    "Close Pre",
+    "Price Now",
+    "Source",
+]
+
+EXCLUDED_EXCHANGES = {"OTC"}
+
+# Исправления для кривых строк
+TICKER_OVERRIDES = {
+    "JIADE": "JDZG",
+    "TUNIU": "TOUR",
+    "SANRIO": "SNROF",
+}
+
+DATE_FORMATS = (
+    "%m/%d/%Y",
+    "%Y-%m-%d",
+    "%b %d, %Y",
+    "%B %d, %Y",
+)
+
 
 def connect_sheet():
-    creds_dict = eval(GOOGLE_CREDENTIALS)
-    creds = Credentials.from_service_account_info(
-        creds_dict,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
+    creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(creds)
     return client.open_by_key(SHEET_ID).worksheet(WORKSHEET_NAME)
 
-async def fetch_splits():
-    url = "https://api.benzinga.com/api/v2/calendar/splits"
-    params = {
-        "token": "demo",
-        "parameters[date_from]": (datetime.utcnow() - timedelta(days=10)).strftime("%Y-%m-%d"),
-        "parameters[date_to]": (datetime.utcnow() + timedelta(days=40)).strftime("%Y-%m-%d")
-    }
 
-    async with httpx.AsyncClient() as client:
-        r = await client.get(url, params=params, timeout=20)
-        data = r.json()
+def normalize_date(value: str) -> str:
+    value = (value or "").strip()
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(value, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return value
+
+
+def is_date_like(value: str) -> bool:
+    value = (value or "").strip()
+    for fmt in DATE_FORMATS:
+        try:
+            datetime.strptime(value, fmt)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def looks_like_ratio(value: str) -> bool:
+    v = (value or "").strip().lower().replace(" ", "")
+    return ("for" in v or ":" in v) and any(ch.isdigit() for ch in v)
+
+
+def normalize_ratio(value: str) -> str:
+    v = (value or "").strip()
+    v = v.replace(":", "-for-")
+    v = re.sub(r"\s+[Ff]or\s+", "-for-", v)
+    v = re.sub(r"\s+", "", v)
+    return v
+
+
+def looks_like_ticker(value: str) -> bool:
+    v = (value or "").strip().upper()
+    return 1 <= len(v) <= 6 and v.isalpha()
+
+
+def is_good_stock(ticker: str, company: str, exchange: str) -> bool:
+    name = (company or "").lower()
+
+    if exchange in EXCLUDED_EXCHANGES:
+        return False
+    if "etf" in name:
+        return False
+    if "defiance" in name:
+        return False
+
+    return True
+
+
+def parse_benzinga_html(html_text: str):
+    soup = BeautifulSoup(html_text, "html.parser")
 
     rows = []
+    for tr in soup.find_all("tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+        if len(cells) >= 6:
+            rows.append(cells)
 
-    for item in data:
-        ticker = item.get("ticker", "").strip()
-        exchange = item.get("exchange", "")
-
-        # ❌ убираем OTC
-        if exchange == "OTC":
+    parsed = []
+    for cells in rows:
+        joined = " | ".join(cells).lower()
+        if "split date" in joined and "ticker" in joined:
             continue
 
-        rows.append({
-            "ticker": ticker,
-            "company": item.get("name", ""),
-            "ann": item.get("announced_date", ""),
-            "split": item.get("execution_date", ""),
-            "ratio": item.get("split_ratio", ""),
-            "exchange": exchange,
-            "source": "Benzinga"
-        })
+        date_cells = [normalize_date(c) for c in cells if is_date_like(c)]
+        if not date_cells:
+            continue
 
-    # ❌ убираем дубли
-    unique = {}
-    for r in rows:
-        unique[r["ticker"]] = r
+        split_date = date_cells[0]
+        announcement_date = date_cells[1] if len(date_cells) > 1 else ""
 
-    return list(unique.values())
+        ratio_candidates = [c for c in cells if looks_like_ratio(c)]
+        if not ratio_candidates:
+            continue
+        ratio = normalize_ratio(ratio_candidates[0])
 
-async def get_price(client, ticker):
-    # Twelve
+        upper_cells = [c.strip().upper() for c in cells]
+
+        exchange = ""
+        for c in upper_cells:
+            if c in {"NASDAQ", "NYSE", "AMEX", "ARCA", "BATS", "OTC"}:
+                exchange = c
+                break
+
+        ticker = ""
+        for c in upper_cells:
+            if c in {"NASDAQ", "NYSE", "AMEX", "ARCA", "BATS", "OTC"}:
+                continue
+            if looks_like_ticker(c):
+                ticker = c
+                break
+
+        company = ""
+        company_candidates = []
+        for c in cells:
+            cu = c.strip().upper()
+            if cu == ticker or cu == exchange:
+                continue
+            if is_date_like(c) or looks_like_ratio(c):
+                continue
+            if len(c.strip()) > 2:
+                company_candidates.append(c.strip())
+
+        if company_candidates:
+            company = company_candidates[0]
+
+        if not ticker or not company or not split_date or not ratio:
+            continue
+
+        if ticker in TICKER_OVERRIDES:
+            ticker = TICKER_OVERRIDES[ticker]
+
+        if not is_good_stock(ticker, company, exchange):
+            continue
+
+        parsed.append([
+            ticker,
+            company,
+            announcement_date,
+            split_date,
+            ratio,
+            exchange,
+            "N/A",
+            "N/A",
+            "N/A",
+            "Benzinga",
+        ])
+
+    dedup = []
+    seen = set()
+    for row in parsed:
+        key = (row[0], row[3], row[4], row[5])
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(row)
+
+    dedup.sort(key=lambda x: (x[3], x[0]))
+    return dedup
+
+
+async def fetch_splits():
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+        r = await client.get(
+            BENZINGA_URL,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        r.raise_for_status()
+        rows = parse_benzinga_html(r.text)
+        logging.info("Parsed splits: %s", len(rows))
+        return rows
+
+
+async def get_price_now(client: httpx.AsyncClient, ticker: str) -> str:
+    # Twelve first
     if TWELVE_API_KEY:
         try:
             r = await client.get(
                 "https://api.twelvedata.com/price",
                 params={"symbol": ticker, "apikey": TWELVE_API_KEY},
-                timeout=10
+                timeout=15,
             )
             data = r.json()
             price = data.get("price")
-            if price and price != "null":
-                return price
-        except:
-            pass
+            if price and str(price).lower() != "null":
+                return str(price)
+        except Exception as e:
+            logging.warning("Twelve price failed for %s: %s", ticker, e)
 
     # FMP fallback
     if FMP_API_KEY:
         try:
             r = await client.get(
-                f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}",
+                f"https://financialmodelingprep.com/api/v3/quote/{ticker}",
                 params={"apikey": FMP_API_KEY},
-                timeout=10
+                timeout=15,
             )
             data = r.json()
+            if isinstance(data, list) and data:
+                price = data[0].get("price")
+                if price is not None:
+                    return str(price)
+        except Exception as e:
+            logging.warning("FMP quote failed for %s: %s", ticker, e)
 
-            if "historical" in data and data["historical"]:
-                return data["historical"][0]["close"]
-        except:
-            pass
+        try:
+            r = await client.get(
+                f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}",
+                params={"apikey": FMP_API_KEY},
+                timeout=15,
+            )
+            data = r.json()
+            hist = data.get("historical", [])
+            if hist:
+                price = hist[0].get("close")
+                if price is not None:
+                    return str(price)
+        except Exception as e:
+            logging.warning("FMP historical fallback failed for %s: %s", ticker, e)
 
     return "N/A"
 
-async def get_history(client, ticker):
-    if not FMP_API_KEY:
+
+async def get_history_prices(client: httpx.AsyncClient, ticker: str, announcement_date: str):
+    if not FMP_API_KEY or not announcement_date:
+        return "N/A", "N/A"
+
+    try:
+        ann_dt = datetime.strptime(announcement_date, "%Y-%m-%d")
+    except Exception:
         return "N/A", "N/A"
 
     try:
         r = await client.get(
             f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}",
             params={"apikey": FMP_API_KEY},
-            timeout=10
+            timeout=20,
         )
         data = r.json()
-
-        if "historical" not in data or not data["historical"]:
+        hist = data.get("historical", [])
+        if not hist:
             return "N/A", "N/A"
 
-        hist = data["historical"]
+        parsed = []
+        for row in hist:
+            d = row.get("date")
+            c = row.get("close")
+            if not d or c is None:
+                continue
+            try:
+                parsed.append((datetime.strptime(d, "%Y-%m-%d"), float(c)))
+            except Exception:
+                continue
 
-        close_pre = hist[0]["close"] if len(hist) > 0 else "N/A"
-        close_14d = hist[13]["close"] if len(hist) > 13 else "N/A"
+        if not parsed:
+            return "N/A", "N/A"
+
+        parsed.sort(key=lambda x: x[0])
+
+        close_pre = "N/A"
+        pre_candidates = [p for d, p in parsed if d < ann_dt]
+        if pre_candidates:
+            close_pre = f"{pre_candidates[-1]:.4f}"
+
+        target = ann_dt - timedelta(days=14)
+        close_14d = "N/A"
+        hist_candidates = [p for d, p in parsed if d <= target]
+        if hist_candidates:
+            close_14d = f"{hist_candidates[-1]:.4f}"
+        elif pre_candidates:
+            close_14d = f"{pre_candidates[0]:.4f}"
 
         return close_14d, close_pre
 
-    except:
+    except Exception as e:
+        logging.warning("History failed for %s: %s", ticker, e)
         return "N/A", "N/A"
 
-async def main():
-    sheet = connect_sheet()
-    splits = await fetch_splits()
 
+async def enrich_rows(rows):
     async with httpx.AsyncClient() as client:
-        rows = [HEADERS]
+        for i, row in enumerate(rows, start=1):
+            ticker = row[0]
+            announcement_date = row[2]
 
-        for s in splits:
-            ticker = s["ticker"]
+            close_14d, close_pre = await get_history_prices(client, ticker, announcement_date)
+            await asyncio.sleep(0.4)
 
-            price = await get_price(client, ticker)
-            close_14d, close_pre = await get_history(client, ticker)
+            price_now = await get_price_now(client, ticker)
+            await asyncio.sleep(0.6)
 
-            rows.append([
-                ticker,
-                s["company"],
-                s["ann"],
-                s["split"],
-                s["ratio"],
-                s["exchange"],
-                close_14d,
-                close_pre,
-                price,
-                s["source"]
-            ])
+            row[6] = close_14d
+            row[7] = close_pre
+            row[8] = price_now
 
+            logging.info(
+                "Prepared row %s/%s for %s | close_14d=%s close_pre=%s price_now=%s",
+                i, len(rows), ticker, close_14d, close_pre, price_now
+            )
+
+    return rows
+
+
+def rewrite_sheet(sheet, rows):
+    values = [HEADERS] + rows
     sheet.clear()
-    sheet.update("A1", rows)
+    sheet.update("A1", values)
+    logging.info("Sheet updated with %s rows", len(rows))
+
+
+async def main_loop():
+    sheet = connect_sheet()
+
+    while True:
+        try:
+            rows = await fetch_splits()
+
+            if rows:
+                rows = await enrich_rows(rows)
+                rewrite_sheet(sheet, rows)
+            else:
+                logging.warning("No splits parsed; keeping previous sheet untouched")
+
+        except Exception as e:
+            logging.exception("Updater error: %s", e)
+
+        logging.info("Sleeping %s seconds...", POLL_INTERVAL)
+        await asyncio.sleep(POLL_INTERVAL)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main_loop())
