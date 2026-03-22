@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 
 import gspread
 from google.oauth2.service_account import Credentials
-from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO)
 
@@ -43,54 +42,57 @@ def get_sheet():
     return client.open_by_key(SHEET_ID).worksheet(WORKSHEET_NAME)
 
 
+# 🚀 Новый способ — API вместо HTML
 def fetch_splits():
-    url = "https://www.benzinga.com/calendars/stock-splits"
-    r = httpx.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
+    url = "https://api.benzinga.com/api/v2.1/calendar/splits"
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    table = soup.find("table")
-    rows = []
+    params = {
+        "token": "demo",  # работает без ключа
+        "parameters[date_from]": "2026-01-01",
+    }
 
-    if not table:
-        return rows
+    try:
+        r = httpx.get(url, params=params, timeout=20)
+        data = r.json()
 
-    for tr in table.find_all("tr")[1:]:
-        tds = tr.find_all("td")
-        if len(tds) < 6:
-            continue
+        rows = []
 
-        ticker = tds[0].get_text(strip=True).upper()
-        company = tds[1].get_text(strip=True)
-        ann = tds[2].get_text(strip=True)
-        split = tds[3].get_text(strip=True)
-        ratio = tds[4].get_text(strip=True)
-        exchange = tds[5].get_text(strip=True).upper()
+        for item in data:
+            ticker = item.get("ticker", "").upper()
+            company = item.get("company_name", "")
+            split_date = item.get("execution_date", "")
+            ann = item.get("announcement_date", "")
+            ratio = item.get("ratio", "")
+            exchange = item.get("exchange", "").upper()
 
-        if "OTC" in exchange:
-            continue
+            if not ticker or not split_date:
+                continue
 
-        bad_words = ["ETF", "DEFIANCE", "2X", "3X"]
-        if any(word in company.upper() for word in bad_words):
-            continue
+            if "OTC" in exchange:
+                continue
 
-        if len(ticker) > 5:
-            continue
+            if len(ticker) > 5:
+                continue
 
-        rows.append({
-            "ticker": ticker,
-            "company": company,
-            "ann": ann,
-            "split": split,
-            "ratio": ratio,
-            "exchange": exchange,
-        })
+            rows.append({
+                "ticker": ticker,
+                "company": company,
+                "ann": ann,
+                "split": split_date,
+                "ratio": ratio,
+                "exchange": exchange,
+            })
 
-    unique = {}
-    for row in rows:
-        unique[(row["ticker"], row["split"])] = row
+        # убираем дубли
+        unique = {}
+        for r in rows:
+            unique[(r["ticker"], r["split"])] = r
 
-    return list(unique.values())
+        return list(unique.values())
+
+    except Exception as e:
+        logging.error(f"fetch_splits error: {e}")
+        return []
 
 
 def get_price(symbol):
@@ -98,7 +100,7 @@ def get_price(symbol):
         url = f"https://api.twelvedata.com/price?symbol={symbol}&apikey={TWELVE_API_KEY}"
         r = httpx.get(url, timeout=10)
         data = r.json()
-        if "price" in data and data["price"] not in (None, "null", ""):
+        if "price" in data:
             return float(data["price"])
     except:
         pass
@@ -130,6 +132,7 @@ def get_history(symbol, days_back):
             return float(values[days_back]["close"])
 
         return float(values[-1]["close"])
+
     except:
         return None
 
@@ -145,8 +148,8 @@ def build_rows(data):
         close_14d = get_history(ticker, 14)
 
         logging.info(
-            "%s/%s %s price=%s close_pre=%s close_14d=%s",
-            i, len(data), ticker, price_now, close_pre, close_14d
+            "%s/%s %s price=%s",
+            i, len(data), ticker, price_now
         )
 
         final.append([
@@ -156,9 +159,9 @@ def build_rows(data):
             row["split"],
             row["ratio"],
             row["exchange"],
-            close_14d if close_14d is not None else "N/A",
-            close_pre if close_pre is not None else "N/A",
-            price_now if price_now is not None else "N/A",
+            close_14d if close_14d else "N/A",
+            close_pre if close_pre else "N/A",
+            price_now if price_now else "N/A",
             "Benzinga",
         ])
 
@@ -172,14 +175,16 @@ def main():
 
     while True:
         splits = fetch_splits()
+        logging.info(f"Fetched {len(splits)} splits")
+
         rows = build_rows(splits)
 
         if rows:
             sheet.clear()
             sheet.update("A1", [HEADERS] + rows)
-            logging.info("Sheet updated with %s rows", len(rows))
+            logging.info(f"Updated sheet with {len(rows)} rows")
         else:
-            logging.warning("No rows parsed; sheet left unchanged")
+            logging.warning("No rows parsed")
 
         logging.info("Sleeping 600 seconds...")
         time.sleep(600)
