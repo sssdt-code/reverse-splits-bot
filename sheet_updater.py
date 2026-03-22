@@ -16,7 +16,7 @@ TWELVE_API_KEY = os.getenv("TWELVE_API_KEY", "").strip()
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "splits_feed").strip()
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS", "").strip()
-POLL_INTERVAL = int(os.getenv("SHEET_POLL_INTERVAL_SECONDS", "600"))
+POLL_INTERVAL = int(os.getenv("SHEET_POLL_INTERVAL_SECONDS", "3600"))
 
 BENZINGA_URL = "https://www.benzinga.com/calendars/stock-splits"
 
