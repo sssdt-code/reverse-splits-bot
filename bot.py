@@ -409,14 +409,15 @@ async def parse_sec_current_reverse_splits(client: httpx.AsyncClient, allowed_sy
 
 async def fetch_upcoming_all(allowed_symbols: set[str]) -> list[dict]:
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
-        results = []
+        calendar_items = []
+        sec_items = []
 
         try:
             r = await client.get(TIPRANKS_URL, timeout=25)
             r.raise_for_status()
             items = parse_tipranks_html(r.text, allowed_symbols)
             logging.info("TipRanks upcoming items: %s", len(items))
-            results.extend(items)
+            calendar_items.extend(items)
         except Exception as e:
             logging.warning("TipRanks fetch/parse failed: %s", e)
 
@@ -425,18 +426,30 @@ async def fetch_upcoming_all(allowed_symbols: set[str]) -> list[dict]:
             r.raise_for_status()
             items = parse_briefing_html(r.text, allowed_symbols)
             logging.info("Briefing upcoming items: %s", len(items))
-            results.extend(items)
+            calendar_items.extend(items)
         except Exception as e:
             logging.warning("Briefing fetch/parse failed: %s", e)
 
         try:
-            items = await parse_sec_current_reverse_splits(client, allowed_symbols)
-            logging.info("SEC fallback items: %s", len(items))
-            results.extend(items)
+            sec_items = await parse_sec_current_reverse_splits(client, allowed_symbols)
+            logging.info("SEC fallback items: %s", len(sec_items))
         except Exception as e:
             logging.warning("SEC fallback failed: %s", e)
 
-    items = dedupe_items(results)
+    # 1) дедупим календарные
+    calendar_items = dedupe_items(calendar_items)
+
+    # 2) SEC имеет приоритет по той же бумаге, если расходится дата/ratio
+    merged = {}
+    for item in calendar_items:
+        merged[item["ticker"]] = item
+
+    for item in sec_items:
+        merged[item["ticker"]] = item
+
+    items = list(merged.values())
+    items = dedupe_items(items)
+
     today = datetime.now().strftime("%Y-%m-%d")
     items = [x for x in items if x["effective_date"] >= today]
     return items
