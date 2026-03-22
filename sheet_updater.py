@@ -1,19 +1,24 @@
 import os
 import json
-import time
-import httpx
 import logging
+import asyncio
+import re
 from datetime import datetime, timedelta
 
+import httpx
 import gspread
+from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY", "").strip()
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "splits_feed").strip()
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS", "")
+POLL_INTERVAL = int(os.getenv("SHEET_POLL_INTERVAL_SECONDS", "600"))
+
+BENZINGA_URL = "https://www.benzinga.com/calendars/stock-splits"
 
 HEADERS = [
     "Ticker",
@@ -27,6 +32,22 @@ HEADERS = [
     "Price Now",
     "Source",
 ]
+
+DATE_FORMATS = (
+    "%m/%d/%Y",
+    "%Y-%m-%d",
+    "%b %d, %Y",
+    "%B %d, %Y",
+)
+
+EXCLUDED_EXCHANGES = {"OTC"}
+BAD_COMPANY_WORDS = {"ETF", "DEFIANCE"}
+
+TICKER_OVERRIDES = {
+    "JIADE": "JDZG",
+    "TUNIU": "TOUR",
+    "SANRIO": "SNROF",
+}
 
 
 def get_sheet():
@@ -42,153 +63,294 @@ def get_sheet():
     return client.open_by_key(SHEET_ID).worksheet(WORKSHEET_NAME)
 
 
-# 🚀 Новый способ — API вместо HTML
-def fetch_splits():
-    url = "https://api.benzinga.com/api/v2.1/calendar/splits"
+def normalize_date(value: str) -> str:
+    value = (value or "").strip()
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(value, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return value
 
-    params = {
-        "token": "demo",  # работает без ключа
-        "parameters[date_from]": "2026-01-01",
-    }
 
-    try:
-        r = httpx.get(url, params=params, timeout=20)
-        data = r.json()
+def is_date_like(value: str) -> bool:
+    value = (value or "").strip()
+    for fmt in DATE_FORMATS:
+        try:
+            datetime.strptime(value, fmt)
+            return True
+        except Exception:
+            pass
+    return False
 
-        rows = []
 
-        for item in data:
-            ticker = item.get("ticker", "").upper()
-            company = item.get("company_name", "")
-            split_date = item.get("execution_date", "")
-            ann = item.get("announcement_date", "")
-            ratio = item.get("ratio", "")
-            exchange = item.get("exchange", "").upper()
+def looks_like_ratio(value: str) -> bool:
+    v = (value or "").strip().lower().replace(" ", "")
+    return ("for" in v or ":" in v) and any(ch.isdigit() for ch in v)
 
-            if not ticker or not split_date:
+
+def normalize_ratio(value: str) -> str:
+    v = (value or "").strip()
+    v = v.replace(":", "-for-")
+    v = re.sub(r"\s+[Ff]or\s+", "-for-", v)
+    v = re.sub(r"\s+", "", v)
+    return v
+
+
+def looks_like_ticker(value: str) -> bool:
+    v = (value or "").strip().upper()
+    return 1 <= len(v) <= 6 and v.isalpha()
+
+
+def is_good_stock(ticker: str, company: str, exchange: str) -> bool:
+    if exchange in EXCLUDED_EXCHANGES:
+        return False
+
+    upper_name = (company or "").upper()
+    if any(word in upper_name for word in BAD_COMPANY_WORDS):
+        return False
+
+    return True
+
+
+def parse_benzinga_html(html_text: str):
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    table_rows = []
+    for tr in soup.find_all("tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+        if len(cells) >= 6:
+            table_rows.append(cells)
+
+    parsed = []
+    for cells in table_rows:
+        joined = " | ".join(cells).lower()
+        if "split date" in joined and "ticker" in joined:
+            continue
+
+        date_cells = [normalize_date(c) for c in cells if is_date_like(c)]
+        if not date_cells:
+            continue
+
+        split_date = date_cells[0]
+        announcement_date = date_cells[1] if len(date_cells) > 1 else ""
+
+        ratio_candidates = [c for c in cells if looks_like_ratio(c)]
+        if not ratio_candidates:
+            continue
+        ratio = normalize_ratio(ratio_candidates[0])
+
+        upper_cells = [c.strip().upper() for c in cells]
+
+        exchange = ""
+        for c in upper_cells:
+            if c in {"NASDAQ", "NYSE", "AMEX", "ARCA", "BATS", "OTC"}:
+                exchange = c
+                break
+
+        ticker = ""
+        for c in upper_cells:
+            if c in {"NASDAQ", "NYSE", "AMEX", "ARCA", "BATS", "OTC"}:
                 continue
+            if looks_like_ticker(c):
+                ticker = c
+                break
 
-            if "OTC" in exchange:
+        company = ""
+        company_candidates = []
+        for c in cells:
+            cu = c.strip().upper()
+            if cu == ticker or cu == exchange:
                 continue
-
-            if len(ticker) > 5:
+            if is_date_like(c) or looks_like_ratio(c):
                 continue
+            if len(c.strip()) > 2:
+                company_candidates.append(c.strip())
 
-            rows.append({
-                "ticker": ticker,
-                "company": company,
-                "ann": ann,
-                "split": split_date,
-                "ratio": ratio,
-                "exchange": exchange,
-            })
+        if company_candidates:
+            company = company_candidates[0]
 
-        # убираем дубли
-        unique = {}
-        for r in rows:
-            unique[(r["ticker"], r["split"])] = r
+        if not ticker or not company or not split_date or not ratio:
+            continue
 
-        return list(unique.values())
+        if ticker in TICKER_OVERRIDES:
+            ticker = TICKER_OVERRIDES[ticker]
 
-    except Exception as e:
-        logging.error(f"fetch_splits error: {e}")
-        return []
+        if not is_good_stock(ticker, company, exchange):
+            continue
 
-
-def get_price(symbol):
-    try:
-        url = f"https://api.twelvedata.com/price?symbol={symbol}&apikey={TWELVE_API_KEY}"
-        r = httpx.get(url, timeout=10)
-        data = r.json()
-        if "price" in data:
-            return float(data["price"])
-    except:
-        pass
-    return None
-
-
-def get_history(symbol, days_back):
-    try:
-        end = datetime.utcnow()
-        start = end - timedelta(days=days_back + 10)
-
-        url = (
-            "https://api.twelvedata.com/time_series"
-            f"?symbol={symbol}"
-            "&interval=1day"
-            f"&start_date={start.date()}"
-            f"&end_date={end.date()}"
-            f"&apikey={TWELVE_API_KEY}"
-        )
-
-        r = httpx.get(url, timeout=15)
-        data = r.json()
-        values = data.get("values", [])
-
-        if not values:
-            return None
-
-        if len(values) > days_back:
-            return float(values[days_back]["close"])
-
-        return float(values[-1]["close"])
-
-    except:
-        return None
-
-
-def build_rows(data):
-    final = []
-
-    for i, row in enumerate(data, start=1):
-        ticker = row["ticker"]
-
-        price_now = get_price(ticker)
-        close_pre = get_history(ticker, 1)
-        close_14d = get_history(ticker, 14)
-
-        logging.info(
-            "%s/%s %s price=%s",
-            i, len(data), ticker, price_now
-        )
-
-        final.append([
+        parsed.append([
             ticker,
-            row["company"],
-            row["ann"],
-            row["split"],
-            row["ratio"],
-            row["exchange"],
-            close_14d if close_14d else "N/A",
-            close_pre if close_pre else "N/A",
-            price_now if price_now else "N/A",
+            company,
+            announcement_date,
+            split_date,
+            ratio,
+            exchange,
+            "N/A",
+            "N/A",
+            "N/A",
             "Benzinga",
         ])
 
-        time.sleep(1)
+    dedup = []
+    seen = set()
+    for row in parsed:
+        key = (row[0], row[3], row[4], row[5])
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(row)
 
-    return final
+    dedup.sort(key=lambda x: (x[3], x[0]))
+    return dedup
 
 
-def main():
+async def fetch_splits():
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+        r = await client.get(
+            BENZINGA_URL,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        r.raise_for_status()
+        rows = parse_benzinga_html(r.text)
+        logging.info("Parsed splits: %s", len(rows))
+        return rows
+
+
+async def twelve_price(client: httpx.AsyncClient, ticker: str):
+    try:
+        r = await client.get(
+            "https://api.twelvedata.com/price",
+            params={"symbol": ticker, "apikey": TWELVE_API_KEY},
+            timeout=15,
+        )
+        data = r.json()
+        price = data.get("price")
+        if price in (None, "", "null"):
+            return None
+        return float(price)
+    except Exception as e:
+        logging.warning("Price failed for %s: %s", ticker, e)
+        return None
+
+
+async def twelve_history(client: httpx.AsyncClient, ticker: str, announcement_date: str):
+    if not announcement_date:
+        return None, None
+
+    try:
+        ann_dt = datetime.strptime(announcement_date, "%Y-%m-%d")
+    except Exception:
+        return None, None
+
+    try:
+        start = (ann_dt - timedelta(days=25)).date()
+        end = ann_dt.date()
+
+        r = await client.get(
+            "https://api.twelvedata.com/time_series",
+            params={
+                "symbol": ticker,
+                "interval": "1day",
+                "start_date": str(start),
+                "end_date": str(end),
+                "outputsize": 40,
+                "apikey": TWELVE_API_KEY,
+            },
+            timeout=20,
+        )
+        data = r.json()
+        values = data.get("values", [])
+        if not values:
+            return None, None
+
+        parsed = []
+        for row in values:
+            dt_raw = row.get("datetime") or row.get("date")
+            close = row.get("close")
+            if not dt_raw or close is None:
+                continue
+            try:
+                dt = datetime.strptime(dt_raw[:10], "%Y-%m-%d")
+                parsed.append((dt, float(close)))
+            except Exception:
+                continue
+
+        if not parsed:
+            return None, None
+
+        parsed.sort(key=lambda x: x[0])
+
+        close_pre = None
+        pre_candidates = [p for d, p in parsed if d < ann_dt]
+        if pre_candidates:
+            close_pre = pre_candidates[-1]
+
+        target = ann_dt - timedelta(days=14)
+        close_14d = None
+        hist_candidates = [p for d, p in parsed if d <= target]
+        if hist_candidates:
+            close_14d = hist_candidates[-1]
+        elif pre_candidates:
+            close_14d = pre_candidates[0]
+
+        return close_14d, close_pre
+
+    except Exception as e:
+        logging.warning("History failed for %s: %s", ticker, e)
+        return None, None
+
+
+async def enrich_rows(rows):
+    async with httpx.AsyncClient() as client:
+        for i, row in enumerate(rows, start=1):
+            ticker = row[0]
+            announcement_date = row[2]
+
+            close_14d, close_pre = await twelve_history(client, ticker, announcement_date)
+            await asyncio.sleep(0.35)
+
+            price_now = await twelve_price(client, ticker)
+            await asyncio.sleep(0.65)
+
+            row[6] = f"{close_14d:.4f}" if close_14d is not None else "N/A"
+            row[7] = f"{close_pre:.4f}" if close_pre is not None else "N/A"
+            row[8] = f"{price_now:.4f}" if price_now is not None else "N/A"
+
+            logging.info(
+                "Prepared row %s/%s for %s | close_14d=%s close_pre=%s price_now=%s",
+                i, len(rows), ticker, row[6], row[7], row[8]
+            )
+
+    return rows
+
+
+def rewrite_sheet(sheet, rows):
+    values = [HEADERS] + rows
+    sheet.clear()
+    sheet.update("A1", values)
+    logging.info("Sheet updated with %s rows", len(rows))
+
+
+async def main_loop():
     sheet = get_sheet()
 
     while True:
-        splits = fetch_splits()
-        logging.info(f"Fetched {len(splits)} splits")
+        try:
+            rows = await fetch_splits()
 
-        rows = build_rows(splits)
+            if rows:
+                rows = await enrich_rows(rows)
+                rewrite_sheet(sheet, rows)
+            else:
+                logging.warning("No rows parsed; keeping previous sheet untouched")
 
-        if rows:
-            sheet.clear()
-            sheet.update("A1", [HEADERS] + rows)
-            logging.info(f"Updated sheet with {len(rows)} rows")
-        else:
-            logging.warning("No rows parsed")
+        except Exception as e:
+            logging.exception("Updater error: %s", e)
 
-        logging.info("Sleeping 600 seconds...")
-        time.sleep(600)
+        logging.info("Sleeping %s seconds...", POLL_INTERVAL)
+        await asyncio.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main_loop())
