@@ -1,5 +1,6 @@
 import asyncio
 import html
+import json
 import logging
 import os
 import re
@@ -26,12 +27,8 @@ HEADERS = {
     "User-Agent": os.getenv("SEC_USER_AGENT", "Sergey Zinin your_email@example.com")
 }
 
-# Основной календарный источник
-BASE_CALENDAR_URLS = [
-    "https://stockanalysis.com/actions/splits/",
-    "https://stockanalysis.com/actions/splits/?p={page}",
-    "https://stockanalysis.com/actions/splits/?page={page}",
-]
+TIPRANKS_URL = "https://www.tipranks.com/calendars/stock-splits/upcoming"
+BRIEFING_URL = "https://www.briefing.com/calendars/splits"
 
 MAIN_MARKET_SYMBOLS_URLS = [
     "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt",
@@ -62,12 +59,9 @@ def parse_any_date(text: str) -> str | None:
 
 def normalize_ratio(text: str) -> str:
     t = " ".join((text or "").strip().split()).lower()
-    m = re.search(r"(\\d+)\\s*[:\\-]?\\s*for\\s*(\\d+)", t)
+    m = re.search(r"(\\d+(?:\\.\\d+)?)\\s*(?:for|:)\\s*(\\d+(?:\\.\\d+)?)", t)
     if m:
         return f"{m.group(1)}-for-{m.group(2)}"
-    m2 = re.search(r"(\\d+)\\s*:\\s*(\\d+)", t)
-    if m2:
-        return f"{m2.group(1)}-for-{m2.group(2)}"
     return (text or "").strip()
 
 def looks_like_symbol(text: str) -> bool:
@@ -93,95 +87,168 @@ async def load_allowed_symbols(client: httpx.AsyncClient) -> set[str]:
     logging.info("Loaded %s main-market symbols", len(symbols))
     return symbols
 
-def extract_rows_from_html(html_text: str, allowed_symbols: set[str]) -> list[dict]:
-    soup = BeautifulSoup(html_text, "html.parser")
-    results = []
-
-    for table in soup.find_all("table"):
-        for tr in table.find_all("tr"):
-            cells = tr.find_all(["td", "th"])
-            texts = [clean_text(c.get_text(" ", strip=True)) for c in cells]
-            if len(texts) < 5:
-                continue
-
-            # Ожидаем примерно:
-            # [Date, Symbol, Company, Type, Ratio, ...]
-            date_text = texts[0]
-            symbol = texts[1].upper().strip()
-            company = texts[2].strip()
-            split_type = texts[3].lower().strip()
-            ratio_text = texts[4].strip()
-
-            iso_date = parse_any_date(date_text)
-            if not iso_date:
-                continue
-            if not looks_like_symbol(symbol):
-                continue
-            if symbol not in allowed_symbols:
-                continue
-            if "reverse" not in split_type:
-                continue
-
-            results.append(
-                {
-                    "ticker": symbol,
-                    "company": company,
-                    "ratio": normalize_ratio(ratio_text),
-                    "effective_date": iso_date,
-                    "source": "StockAnalysis calendar",
-                }
-            )
-    return results
-
-async def fetch_calendar_all(allowed_symbols: set[str]) -> list[dict]:
-    results = []
-    seen_pages = set()
-
-    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
-        # Базовая страница
-        for url in [
-            "https://stockanalysis.com/actions/splits/",
-        ]:
-            try:
-                r = await client.get(url, timeout=20)
-                r.raise_for_status()
-                rows = extract_rows_from_html(r.text, allowed_symbols)
-                results.extend(rows)
-                seen_pages.add(url)
-                logging.info("Fetched base calendar page: %s rows", len(rows))
-            except Exception as e:
-                logging.warning("Failed to fetch base calendar page %s: %s", url, e)
-
-        # Пробуем несколько страниц/вариантов URL, чтобы захватить более дальние upcoming
-        for page in range(1, 8):
-            for template in BASE_CALENDAR_URLS[1:]:
-                url = template.format(page=page)
-                if url in seen_pages:
-                    continue
-                try:
-                    r = await client.get(url, timeout=20)
-                    if r.status_code >= 400:
-                        continue
-                    rows = extract_rows_from_html(r.text, allowed_symbols)
-                    if rows:
-                        logging.info("Fetched paged calendar %s: %s rows", url, len(rows))
-                        results.extend(rows)
-                    seen_pages.add(url)
-                except Exception as e:
-                    logging.warning("Failed to fetch paged calendar %s: %s", url, e)
-
+def dedupe_items(items: list[dict]) -> list[dict]:
     deduped = []
     seen = set()
-    for item in results:
+    for item in items:
         key = (item["ticker"], item["ratio"], item["effective_date"])
         if key in seen:
             continue
         seen.add(key)
         deduped.append(item)
-
     deduped.sort(key=lambda x: (x["effective_date"], x["ticker"]))
-    logging.info("Calendar deduped items total: %s", len(deduped))
     return deduped
+
+def parse_tipranks_html(html_text: str, allowed_symbols: set[str]) -> list[dict]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    results = []
+
+    # 1) Try JSON-LD / embedded JSON first
+    scripts = soup.find_all("script")
+    for script in scripts:
+        txt = script.string or script.get_text(" ", strip=False)
+        if not txt:
+            continue
+
+        # Look for obvious stock-splits data blobs
+        if "stock-splits" in txt.lower() or "upcoming" in txt.lower() or "AKTX" in txt:
+            # Try to find simple objects with ticker/date/ratio/type
+            for m in re.finditer(
+                r'"ticker"\s*:\s*"(?P<ticker>[A-Z]{1,5})".{0,500}?"date"\s*:\s*"(?P<date>[^"]+)".{0,500}?"type"\s*:\s*"(?P<type>[^"]+)".{0,500}?"ratio"\s*:\s*"?(?P<ratio>[^",}]+)"?',
+                txt,
+                re.IGNORECASE | re.DOTALL,
+            ):
+                ticker = m.group("ticker").upper()
+                if ticker not in allowed_symbols:
+                    continue
+                typ = m.group("type").lower()
+                if "reverse" not in typ:
+                    continue
+                iso_date = parse_any_date(m.group("date"))
+                if not iso_date:
+                    continue
+                ratio = normalize_ratio(m.group("ratio"))
+                results.append(
+                    {
+                        "ticker": ticker,
+                        "company": "",
+                        "ratio": ratio,
+                        "effective_date": iso_date,
+                        "source": "TipRanks upcoming",
+                    }
+                )
+
+    if results:
+        return dedupe_items(results)
+
+    # 2) Fallback: parse visible text blocks
+    text = soup.get_text("\n", strip=True)
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+
+    current_date = None
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        maybe_date = parse_any_date(line)
+        if maybe_date:
+            current_date = maybe_date
+            i += 1
+            continue
+
+        if current_date and looks_like_symbol(line):
+            ticker = line
+            company = lines[i + 1] if i + 1 < len(lines) else ""
+            split_type = lines[i + 2].lower() if i + 2 < len(lines) else ""
+            ratio = lines[i + 3] if i + 3 < len(lines) else ""
+
+            if ticker in allowed_symbols and "reverse" in split_type:
+                results.append(
+                    {
+                        "ticker": ticker,
+                        "company": company,
+                        "ratio": normalize_ratio(ratio),
+                        "effective_date": current_date,
+                        "source": "TipRanks upcoming",
+                    }
+                )
+            i += 4
+            continue
+
+        i += 1
+
+    return dedupe_items(results)
+
+def parse_briefing_html(html_text: str, allowed_symbols: set[str]) -> list[dict]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    results = []
+
+    text = soup.get_text("\n", strip=True)
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+
+    current_date = None
+    for idx, line in enumerate(lines):
+        maybe_date = parse_any_date(line)
+        if maybe_date:
+            current_date = maybe_date
+            continue
+
+        # Briefing style:
+        # Co: YYGH  YY Group Holding ... | Ratio: 1-50 | Payable... | Ex-Date*: 23-Mar-26
+        if "Co:" in line and "Ratio:" in line:
+            m = re.search(r"Co:\s*([A-Z]{1,5})\s+(.*?)\|\s*Ratio:\s*([^\|]+)", line)
+            if not m:
+                continue
+            ticker = m.group(1).upper()
+            if ticker not in allowed_symbols:
+                continue
+            company = m.group(2).strip()
+            ratio = normalize_ratio(m.group(3))
+            ex_m = re.search(r"Ex-Date\*?:\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{2,4}|\d{2}-[A-Za-z]{3}-\d{2})", line)
+            eff_date = None
+            if ex_m:
+                ex_txt = ex_m.group(1).replace("-", " ")
+                eff_date = parse_any_date(ex_txt)
+            if not eff_date and current_date:
+                eff_date = current_date
+            if not eff_date:
+                continue
+            results.append(
+                {
+                    "ticker": ticker,
+                    "company": company,
+                    "ratio": ratio,
+                    "effective_date": eff_date,
+                    "source": "Briefing upcoming",
+                }
+            )
+
+    return dedupe_items(results)
+
+async def fetch_upcoming_all(allowed_symbols: set[str]) -> list[dict]:
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
+        results = []
+
+        # Primary: TipRanks upcoming
+        try:
+            r = await client.get(TIPRANKS_URL, timeout=25)
+            r.raise_for_status()
+            tip_items = parse_tipranks_html(r.text, allowed_symbols)
+            logging.info("TipRanks upcoming items: %s", len(tip_items))
+            results.extend(tip_items)
+        except Exception as e:
+            logging.warning("TipRanks fetch/parse failed: %s", e)
+
+        # Secondary: Briefing
+        try:
+            r = await client.get(BRIEFING_URL, timeout=25)
+            r.raise_for_status()
+            brief_items = parse_briefing_html(r.text, allowed_symbols)
+            logging.info("Briefing upcoming items: %s", len(brief_items))
+            results.extend(brief_items)
+        except Exception as e:
+            logging.warning("Briefing fetch/parse failed: %s", e)
+
+    return dedupe_items(results)
 
 def filter_by_date(items: list[dict], target_date: str) -> list[dict]:
     return [x for x in items if x["effective_date"] == target_date]
@@ -224,7 +291,8 @@ def format_grouped(title: str, items: list[dict]) -> str:
             current = item["effective_date"]
             lines.append("")
             lines.append(f"📅 {current}")
-        lines.append(f"{item['ticker']} | {item['ratio']} | {item['company']}")
+        company = item["company"] or ""
+        lines.append(f"{item['ticker']} | {item['ratio']} | {company}")
     return "\n".join(lines)
 
 def format_date_list(title: str, target_date: str, items: list[dict]) -> str:
@@ -232,7 +300,8 @@ def format_date_list(title: str, target_date: str, items: list[dict]) -> str:
         return f"На {target_date} upcoming reverse splits не найдены."
     lines = [f"{title} {target_date}:"]
     for item in items:
-        lines.append(f"{item['ticker']} | {item['ratio']} | {item['company']}")
+        company = item["company"] or ""
+        lines.append(f"{item['ticker']} | {item['ratio']} | {company}")
     return "\n".join(lines)
 
 def format_calendar_push(item: dict) -> str:
@@ -246,7 +315,6 @@ def format_calendar_push(item: dict) -> str:
     )
 
 async def send_text(bot, text: str) -> None:
-    # Telegram limits, режем длинные сообщения
     chunk_size = 3500
     if len(text) <= chunk_size:
         await bot.send_message(chat_id=CHAT_ID, text=text, disable_web_page_preview=True)
@@ -281,18 +349,18 @@ async def scanner_loop(app: Application) -> None:
     allowed_symbols = await ensure_allowed_symbols(app)
 
     try:
-        initial = await fetch_calendar_all(allowed_symbols)
+        initial = await fetch_upcoming_all(allowed_symbols)
         for item in initial:
             key = f'{item["ticker"]}|{item["ratio"]}|{item["effective_date"]}'
             sent_calendar.add(key)
-        logging.info("Seeded calendar cache with %s items", len(sent_calendar))
+        logging.info("Seeded upcoming cache with %s items", len(sent_calendar))
     except Exception as e:
-        logging.warning("Failed to seed calendar cache: %s", e)
+        logging.warning("Failed to seed upcoming cache: %s", e)
 
     while True:
         try:
-            items = await fetch_calendar_all(allowed_symbols)
-            logging.info("Calendar items fetched: %s", len(items))
+            items = await fetch_upcoming_all(allowed_symbols)
+            logging.info("Upcoming items fetched: %s", len(items))
 
             today = datetime.now().strftime("%Y-%m-%d")
             future_items = [x for x in items if x["effective_date"] >= today]
@@ -305,14 +373,14 @@ async def scanner_loop(app: Application) -> None:
                 sent_calendar.add(key)
                 new_items.append(item)
 
-            logging.info("New calendar items this cycle: %s", len(new_items))
+            logging.info("New upcoming items this cycle: %s", len(new_items))
 
             for item in new_items:
-                logging.info("Sending calendar push: %s %s %s", item["ticker"], item["ratio"], item["effective_date"])
+                logging.info("Sending upcoming push: %s %s %s", item["ticker"], item["ratio"], item["effective_date"])
                 await send_text(app.bot, format_calendar_push(item))
 
         except Exception as e:
-            logging.exception("Calendar scanner loop error: %s", e)
+            logging.exception("Upcoming scanner loop error: %s", e)
 
         logging.info("Sleeping %s seconds...", POLL_SECONDS)
         await asyncio.sleep(POLL_SECONDS)
@@ -323,7 +391,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Status: running\n"
-        "Mode: full calendar monitor\n"
+        "Mode: full upcoming calendar monitor\n"
         f"Poll interval: {POLL_SECONDS} sec"
     )
 
@@ -332,28 +400,28 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     allowed_symbols = await ensure_allowed_symbols(context.application)
-    items = await fetch_calendar_all(allowed_symbols)
+    items = await fetch_upcoming_all(allowed_symbols)
     today = datetime.now().strftime("%Y-%m-%d")
     items = [x for x in items if x["effective_date"] >= today]
     await send_text(context.application.bot, format_grouped("📋 Все upcoming reverse splits", items))
 
 async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     allowed_symbols = await ensure_allowed_symbols(context.application)
-    items = await fetch_calendar_all(allowed_symbols)
+    items = await fetch_upcoming_all(allowed_symbols)
     start_date, end_date = current_month_range()
     items = filter_range(items, start_date, end_date)
     await send_text(context.application.bot, format_grouped("🗓 Reverse splits в этом месяце", items))
 
 async def cmd_nextmonth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     allowed_symbols = await ensure_allowed_symbols(context.application)
-    items = await fetch_calendar_all(allowed_symbols)
+    items = await fetch_upcoming_all(allowed_symbols)
     start_date, end_date = next_month_range()
     items = filter_range(items, start_date, end_date)
     await send_text(context.application.bot, format_grouped("🗓 Reverse splits в следующем месяце", items))
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     allowed_symbols = await ensure_allowed_symbols(context.application)
-    items = await fetch_calendar_all(allowed_symbols)
+    items = await fetch_upcoming_all(allowed_symbols)
     start_date = datetime.now().strftime("%Y-%m-%d")
     end_date = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
     items = filter_range(items, start_date, end_date)
@@ -372,28 +440,28 @@ async def cmd_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     allowed_symbols = await ensure_allowed_symbols(context.application)
-    items = await fetch_calendar_all(allowed_symbols)
+    items = await fetch_upcoming_all(allowed_symbols)
     items = filter_by_date(items, target_date)
     await send_text(context.application.bot, format_date_list("📅 Upcoming reverse splits на", target_date, items))
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     target_date = datetime.now().strftime("%Y-%m-%d")
     allowed_symbols = await ensure_allowed_symbols(context.application)
-    items = await fetch_calendar_all(allowed_symbols)
+    items = await fetch_upcoming_all(allowed_symbols)
     items = filter_by_date(items, target_date)
     await send_text(context.application.bot, format_date_list("📅 Reverse splits на сегодня", target_date, items))
 
 async def cmd_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     target_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
     allowed_symbols = await ensure_allowed_symbols(context.application)
-    items = await fetch_calendar_all(allowed_symbols)
+    items = await fetch_upcoming_all(allowed_symbols)
     items = filter_by_date(items, target_date)
     await send_text(context.application.bot, format_date_list("📅 Reverse splits на завтра", target_date, items))
 
 async def cmd_t1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     target_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
     allowed_symbols = await ensure_allowed_symbols(context.application)
-    items = await fetch_calendar_all(allowed_symbols)
+    items = await fetch_upcoming_all(allowed_symbols)
     items = filter_by_date(items, target_date)
     await send_text(context.application.bot, format_date_list("🔥 T-1 reverse splits на", target_date, items))
 
