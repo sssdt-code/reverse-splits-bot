@@ -1,5 +1,6 @@
 import asyncio
 import html
+import json
 import logging
 import os
 import re
@@ -42,8 +43,8 @@ STRICT_RS_PHRASES = [
     "reverse split",
     "share consolidation",
     "stock consolidation",
-    "ratio change",      # catches ADS ratio changes like AKTX
-    "ads ratio change",  # catches ADS ratio changes like AKTX
+    "ratio change",
+    "ads ratio change",
 ]
 
 DATE_FORMATS = (
@@ -77,11 +78,13 @@ NUMBER_WORDS = {
     "ninety": "90", "hundred": "100",
 }
 
+
 def clean_text(value: str) -> str:
     if not value:
         return ""
     soup = BeautifulSoup(value, "html.parser")
     return html.unescape(soup.get_text(" ", strip=True))
+
 
 def parse_any_date(text: str) -> str | None:
     text = " ".join((text or "").strip().replace(",", ", ").split())
@@ -91,6 +94,7 @@ def parse_any_date(text: str) -> str | None:
         except ValueError:
             continue
     return None
+
 
 def parse_number_words(token: str) -> str | None:
     token = token.lower().strip()
@@ -103,6 +107,7 @@ def parse_number_words(token: str) -> str | None:
             if len(vals) == 2 and vals[0] in {"20", "30", "40", "50", "60", "70", "80", "90"}:
                 return str(int(vals[0]) + int(vals[1]))
     return NUMBER_WORDS.get(token)
+
 
 def normalize_ratio(text: str) -> str:
     t = " ".join((text or "").strip().split()).lower()
@@ -121,8 +126,10 @@ def normalize_ratio(text: str) -> str:
 
     return (text or "").strip()
 
+
 def looks_like_symbol(text: str) -> bool:
     return bool(re.fullmatch(r"[A-Z]{1,5}", (text or "").strip()))
+
 
 def current_month_range() -> tuple[str, str]:
     today = date.today()
@@ -133,6 +140,7 @@ def current_month_range() -> tuple[str, str]:
         next_month = date(today.year, today.month + 1, 1)
     last = next_month - timedelta(days=1)
     return first.isoformat(), last.isoformat()
+
 
 def next_month_range() -> tuple[str, str]:
     today = date.today()
@@ -148,11 +156,14 @@ def next_month_range() -> tuple[str, str]:
     last = next_after - timedelta(days=1)
     return first.isoformat(), last.isoformat()
 
+
 def filter_by_date(items: list[dict], target_date: str) -> list[dict]:
     return [x for x in items if x["effective_date"] == target_date]
 
+
 def filter_range(items: list[dict], start_date: str, end_date: str) -> list[dict]:
     return [x for x in items if start_date <= x["effective_date"] <= end_date]
+
 
 def dedupe_items(items: list[dict]) -> list[dict]:
     deduped = []
@@ -166,12 +177,14 @@ def dedupe_items(items: list[dict]) -> list[dict]:
     deduped.sort(key=lambda x: (x["effective_date"], x["ticker"]))
     return deduped
 
+
 def extract_best_ticker(text: str, allowed_symbols: set[str]) -> str | None:
     for c in TICKER_RE.findall(text or ""):
         sym = c.upper()
         if sym in allowed_symbols:
             return sym
     return None
+
 
 async def load_allowed_symbols(client: httpx.AsyncClient) -> set[str]:
     symbols = set()
@@ -193,47 +206,76 @@ async def load_allowed_symbols(client: httpx.AsyncClient) -> set[str]:
     logging.info("Loaded %s main-market symbols", len(symbols))
     return symbols
 
-def parse_tipranks_text(html_text: str, allowed_symbols: set[str]) -> list[dict]:
+
+def parse_tipranks_html(html_text: str, allowed_symbols: set[str]) -> list[dict]:
     soup = BeautifulSoup(html_text, "html.parser")
-    text = soup.get_text("\n", strip=True)
-    lines = [x.strip() for x in text.splitlines() if x.strip()]
     results = []
 
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        maybe_date = parse_any_date(line)
-        if not maybe_date:
-            i += 1
+    # 1) Try embedded JSON first
+    for script in soup.find_all("script"):
+        txt = script.string or script.get_text(" ", strip=False)
+        if not txt:
+            continue
+        if "stock-splits" not in txt.lower() and "upcoming" not in txt.lower() and "reverse" not in txt.lower():
             continue
 
-        if i + 3 >= len(lines):
-            i += 1
-            continue
-
-        ticker = lines[i + 1].strip().upper()
-        company = lines[i + 2].strip()
-        split_line = lines[i + 3].strip().lower()
-
-        if looks_like_symbol(ticker) and ticker in allowed_symbols and "reverse" in split_line:
-            ratio = normalize_ratio(split_line)
+        for m in re.finditer(
+            r'"ticker"\s*:\s*"(?P<ticker>[A-Z]{1,5})".{0,800}?"date"\s*:\s*"(?P<date>[^"]+)".{0,800}?"type"\s*:\s*"(?P<type>[^"]+)".{0,800}?"ratio"\s*:\s*"?(?P<ratio>[^",}]+)"?',
+            txt,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            ticker = m.group("ticker").upper()
+            if ticker not in allowed_symbols:
+                continue
+            split_type = m.group("type").lower()
+            if "reverse" not in split_type:
+                continue
+            eff_date = parse_any_date(m.group("date"))
+            if not eff_date:
+                continue
+            ratio = normalize_ratio(m.group("ratio"))
             results.append(
                 {
                     "ticker": ticker,
-                    "company": company,
+                    "company": "",
                     "ratio": ratio,
-                    "effective_date": maybe_date,
+                    "effective_date": eff_date,
                     "source": "TipRanks upcoming",
                 }
             )
-            i += 4
-            continue
 
+    if results:
+        return dedupe_items(results)
+
+    # 2) Fallback: parse visible lines
+    text = soup.get_text("\n", strip=True)
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    i = 0
+    while i < len(lines):
+        maybe_date = parse_any_date(lines[i])
+        if maybe_date and i + 3 < len(lines):
+            ticker = lines[i + 1].upper()
+            company = lines[i + 2]
+            kind = lines[i + 3].lower()
+            ratio = lines[i + 4] if i + 4 < len(lines) else ""
+            if looks_like_symbol(ticker) and ticker in allowed_symbols and "reverse" in kind:
+                results.append(
+                    {
+                        "ticker": ticker,
+                        "company": company,
+                        "ratio": normalize_ratio(ratio),
+                        "effective_date": maybe_date,
+                        "source": "TipRanks upcoming",
+                    }
+                )
+                i += 5
+                continue
         i += 1
 
     return dedupe_items(results)
 
-def parse_briefing_text(html_text: str, allowed_symbols: set[str]) -> list[dict]:
+
+def parse_briefing_html(html_text: str, allowed_symbols: set[str]) -> list[dict]:
     soup = BeautifulSoup(html_text, "html.parser")
     text = soup.get_text("\n", strip=True)
     lines = [x.strip() for x in text.splitlines() if x.strip()]
@@ -255,11 +297,10 @@ def parse_briefing_text(html_text: str, allowed_symbols: set[str]) -> list[dict]
         ratio = normalize_ratio(m.group(3))
 
         ex_m = re.search(r"Ex-Date\*?:\s*([0-9]{2}-[A-Za-z]{3}-[0-9]{2,4})", line)
-        if not ex_m:
-            continue
-
-        ex_txt = ex_m.group(1).replace("-", " ")
-        eff_date = parse_any_date(ex_txt)
+        eff_date = None
+        if ex_m:
+            ex_txt = ex_m.group(1).replace("-", " ")
+            eff_date = parse_any_date(ex_txt)
         if not eff_date:
             continue
 
@@ -275,12 +316,14 @@ def parse_briefing_text(html_text: str, allowed_symbols: set[str]) -> list[dict]
 
     return dedupe_items(results)
 
+
 def extract_effective_date_from_text(text: str) -> str | None:
     patterns = [
         r"effective on or about ([A-Z][a-z]+ \d{1,2}, \d{4})",
         r"effective on ([A-Z][a-z]+ \d{1,2}, \d{4})",
         r"effective date(?: is)? ([A-Z][a-z]+ \d{1,2}, \d{4})",
         r"expected to be effective on ([A-Z][a-z]+ \d{1,2}, \d{4})",
+        r"commence trading on ([A-Z][a-z]+ \d{1,2}, \d{4})",
         r"([A-Z][a-z]+ \d{1,2}, \d{4})",
     ]
     for p in patterns:
@@ -291,9 +334,11 @@ def extract_effective_date_from_text(text: str) -> str | None:
                 return iso
     return None
 
+
 def has_reverse_split_signal(text: str) -> bool:
     t = (text or "").lower()
     return any(p in t for p in STRICT_RS_PHRASES)
+
 
 async def parse_sec_current_reverse_splits(client: httpx.AsyncClient, allowed_symbols: set[str]) -> list[dict]:
     results = []
@@ -303,7 +348,7 @@ async def parse_sec_current_reverse_splits(client: httpx.AsyncClient, allowed_sy
         logging.warning("SEC current parse failed: %s", e)
         return results
 
-    for entry in feed.entries[:120]:
+    for entry in feed.entries[:150]:
         title = clean_text(entry.get("title", ""))
         summary = clean_text(entry.get("summary", "") or entry.get("description", ""))
         link = entry.get("link", "")
@@ -315,27 +360,23 @@ async def parse_sec_current_reverse_splits(client: httpx.AsyncClient, allowed_sy
             except Exception:
                 published_dt = None
 
-        # Keep recent-ish filings only
         if published_dt:
-            cutoff = datetime.utcnow() - timedelta(days=21)
-            try:
-                naive_pub = published_dt.replace(tzinfo=None)
-            except Exception:
-                naive_pub = None
-            if naive_pub and naive_pub < cutoff:
+            cutoff = datetime.utcnow() - timedelta(days=45)
+            naive_pub = published_dt.replace(tzinfo=None) if published_dt.tzinfo else published_dt
+            if naive_pub < cutoff:
                 continue
 
         combined = f"{title}\n{summary}"
+
         if not has_reverse_split_signal(combined):
-            # fetch filing page text and check there
             try:
                 r = await client.get(link, timeout=25, follow_redirects=True)
                 r.raise_for_status()
-                page_text = clean_text(r.text)
+                filing_text = clean_text(r.text)
+                combined = f"{combined}\n{filing_text}"
             except Exception as e:
                 logging.warning("SEC filing fetch failed %s: %s", link, e)
                 continue
-            combined = f"{combined}\n{page_text}"
 
         if not has_reverse_split_signal(combined):
             continue
@@ -353,10 +394,6 @@ async def parse_sec_current_reverse_splits(client: httpx.AsyncClient, allowed_sy
             continue
 
         company = ""
-        mco = re.search(rf"{ticker}\),?\s+an?\s+(.*?)(?:, today announced| announced| disclosed)", combined, re.IGNORECASE)
-        if mco:
-            company = mco.group(1).strip()
-
         results.append(
             {
                 "ticker": ticker,
@@ -369,6 +406,7 @@ async def parse_sec_current_reverse_splits(client: httpx.AsyncClient, allowed_sy
 
     return dedupe_items(results)
 
+
 async def fetch_upcoming_all(allowed_symbols: set[str]) -> list[dict]:
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
         results = []
@@ -376,25 +414,25 @@ async def fetch_upcoming_all(allowed_symbols: set[str]) -> list[dict]:
         try:
             r = await client.get(TIPRANKS_URL, timeout=25)
             r.raise_for_status()
-            tip_items = parse_tipranks_text(r.text, allowed_symbols)
-            logging.info("TipRanks upcoming items: %s", len(tip_items))
-            results.extend(tip_items)
+            items = parse_tipranks_html(r.text, allowed_symbols)
+            logging.info("TipRanks upcoming items: %s", len(items))
+            results.extend(items)
         except Exception as e:
             logging.warning("TipRanks fetch/parse failed: %s", e)
 
         try:
             r = await client.get(BRIEFING_URL, timeout=25)
             r.raise_for_status()
-            brief_items = parse_briefing_text(r.text, allowed_symbols)
-            logging.info("Briefing upcoming items: %s", len(brief_items))
-            results.extend(brief_items)
+            items = parse_briefing_html(r.text, allowed_symbols)
+            logging.info("Briefing upcoming items: %s", len(items))
+            results.extend(items)
         except Exception as e:
             logging.warning("Briefing fetch/parse failed: %s", e)
 
         try:
-            sec_items = await parse_sec_current_reverse_splits(client, allowed_symbols)
-            logging.info("SEC fallback items: %s", len(sec_items))
-            results.extend(sec_items)
+            items = await parse_sec_current_reverse_splits(client, allowed_symbols)
+            logging.info("SEC fallback items: %s", len(items))
+            results.extend(items)
         except Exception as e:
             logging.warning("SEC fallback failed: %s", e)
 
@@ -402,6 +440,7 @@ async def fetch_upcoming_all(allowed_symbols: set[str]) -> list[dict]:
     today = datetime.now().strftime("%Y-%m-%d")
     items = [x for x in items if x["effective_date"] >= today]
     return items
+
 
 def format_grouped(title: str, items: list[dict]) -> str:
     if not items:
@@ -418,6 +457,7 @@ def format_grouped(title: str, items: list[dict]) -> str:
         lines.append(f"{item['ticker']} | {item['ratio']} | {company}")
     return "\n".join(lines)
 
+
 def format_date_list(title: str, target_date: str, items: list[dict]) -> str:
     if not items:
         return f"На {target_date} upcoming reverse splits не найдены."
@@ -426,6 +466,7 @@ def format_date_list(title: str, target_date: str, items: list[dict]) -> str:
         company = item["company"] or ""
         lines.append(f"{item['ticker']} | {item['ratio']} | {company}")
     return "\n".join(lines)
+
 
 def format_calendar_push(item: dict) -> str:
     return (
@@ -436,6 +477,7 @@ def format_calendar_push(item: dict) -> str:
         f"Company: {item['company']}\n"
         f"Source: {item['source']}"
     )
+
 
 async def send_text(bot, text: str) -> None:
     chunk_size = 3500
@@ -457,6 +499,7 @@ async def send_text(bot, text: str) -> None:
     for part in parts:
         await bot.send_message(chat_id=CHAT_ID, text=part, disable_web_page_preview=True)
 
+
 async def ensure_allowed_symbols(app: Application) -> set[str]:
     allowed_symbols = app.bot_data.get("allowed_symbols", set())
     if allowed_symbols:
@@ -466,6 +509,7 @@ async def ensure_allowed_symbols(app: Application) -> set[str]:
         allowed_symbols = await load_allowed_symbols(client)
     app.bot_data["allowed_symbols"] = allowed_symbols
     return allowed_symbols
+
 
 async def scanner_loop(app: Application) -> None:
     sent_upcoming = set()
@@ -505,8 +549,10 @@ async def scanner_loop(app: Application) -> None:
         logging.info("Sleeping %s seconds...", POLL_SECONDS)
         await asyncio.sleep(POLL_SECONDS)
 
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Bot running")
+
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
@@ -515,13 +561,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Poll interval: {POLL_SECONDS} sec"
     )
 
+
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Test OK")
+
 
 async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     allowed_symbols = await ensure_allowed_symbols(context.application)
     items = await fetch_upcoming_all(allowed_symbols)
     await send_text(context.application.bot, format_grouped("📋 Все upcoming reverse splits", items))
+
 
 async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     allowed_symbols = await ensure_allowed_symbols(context.application)
@@ -530,12 +579,14 @@ async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     items = filter_range(items, start_date, end_date)
     await send_text(context.application.bot, format_grouped("🗓 Reverse splits в этом месяце", items))
 
+
 async def cmd_nextmonth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     allowed_symbols = await ensure_allowed_symbols(context.application)
     items = await fetch_upcoming_all(allowed_symbols)
     start_date, end_date = next_month_range()
     items = filter_range(items, start_date, end_date)
     await send_text(context.application.bot, format_grouped("🗓 Reverse splits в следующем месяце", items))
+
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     allowed_symbols = await ensure_allowed_symbols(context.application)
@@ -544,6 +595,7 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     end_date = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
     items = filter_range(items, start_date, end_date)
     await send_text(context.application.bot, format_grouped("📆 Reverse splits на 7 дней", items))
+
 
 async def cmd_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -562,12 +614,14 @@ async def cmd_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     items = filter_by_date(items, target_date)
     await send_text(context.application.bot, format_date_list("📅 Upcoming reverse splits на", target_date, items))
 
+
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     target_date = datetime.now().strftime("%Y-%m-%d")
     allowed_symbols = await ensure_allowed_symbols(context.application)
     items = await fetch_upcoming_all(allowed_symbols)
     items = filter_by_date(items, target_date)
     await send_text(context.application.bot, format_date_list("📅 Reverse splits на сегодня", target_date, items))
+
 
 async def cmd_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     target_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -576,6 +630,7 @@ async def cmd_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     items = filter_by_date(items, target_date)
     await send_text(context.application.bot, format_date_list("📅 Reverse splits на завтра", target_date, items))
 
+
 async def cmd_t1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     target_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
     allowed_symbols = await ensure_allowed_symbols(context.application)
@@ -583,8 +638,10 @@ async def cmd_t1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     items = filter_by_date(items, target_date)
     await send_text(context.application.bot, format_date_list("🔥 T-1 reverse splits на", target_date, items))
 
+
 async def post_init(app: Application) -> None:
     asyncio.create_task(scanner_loop(app))
+
 
 def main() -> None:
     if not BOT_TOKEN:
@@ -607,6 +664,7 @@ def main() -> None:
 
     logging.info("Bot starting...")
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
