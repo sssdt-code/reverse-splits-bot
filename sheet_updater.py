@@ -180,18 +180,18 @@ def parse_benzinga_html(html_text: str):
             continue
 
         parsed.append([
-            ticker,
-            company,
-            announcement_date,
-            split_date,
-            ratio,
-            exchange,
-            "N/A",  # G
-            "N/A",  # H
-            "N/A",  # I
-            "",     # J formula
-            "",     # K formula
-            "Benzinga",  # L
+            ticker,          # A
+            company,         # B
+            announcement_date,  # C
+            split_date,      # D
+            ratio,           # E
+            exchange,        # F
+            "",              # G Close -14D
+            "",              # H Close Pre
+            "",              # I Price Now
+            "",              # J formula
+            "",              # K formula
+            "Benzinga",      # L
         ])
 
     dedup = []
@@ -290,17 +290,16 @@ async def enrich_rows(rows):
 
             price_now, close_pre, close_14d = await twelve_series(client, ticker, announcement_date)
 
-            row[6] = f"{close_14d:.4f}" if close_14d is not None else "N/A"
-            row[7] = f"{close_pre:.4f}" if close_pre is not None else "N/A"
-            row[8] = f"{price_now:.4f}" if price_now is not None else "N/A"
+            # Пишем ЧИСЛА, а не строки
+            row[6] = round(close_14d, 4) if close_14d is not None else ""
+            row[7] = round(close_pre, 4) if close_pre is not None else ""
+            row[8] = round(price_now, 4) if price_now is not None else ""
 
-            sheet_row = i + 1  # because header is row 1
+            sheet_row = i + 1  # строка на листе, потому что header = 1
 
-            # J = % vs Close -14D
-            row[9] = f'=IF(OR(G{sheet_row}="N/A";I{sheet_row}="N/A";G{sheet_row}=0);"";I{sheet_row}/G{sheet_row}-1)'
-
-            # K = % vs Close Pre
-            row[10] = f'=IF(OR(H{sheet_row}="N/A";I{sheet_row}="N/A";H{sheet_row}=0);"";I{sheet_row}/H{sheet_row}-1)'
+            # Формулы с русской локалью (;)
+            row[9] = f'=IF(OR(G{sheet_row}="";I{sheet_row}="";G{sheet_row}=0);"";I{sheet_row}/G{sheet_row}-1)'
+            row[10] = f'=IF(OR(H{sheet_row}="";I{sheet_row}="";H{sheet_row}=0);"";I{sheet_row}/H{sheet_row}-1)'
 
             logging.info(
                 "Prepared row %s/%s for %s | close_14d=%s close_pre=%s price_now=%s",
@@ -313,24 +312,37 @@ async def enrich_rows(rows):
 
 
 def apply_formatting(sheet, row_count: int):
-    try:
-        # проценты в J:K
-        sheet.format(
-            f"J2:K{row_count}",
-            {
-                "numberFormat": {
-                    "type": "PERCENT",
-                    "pattern": "0.00%"
-                }
-            }
-        )
+    last_row = max(row_count, 2)
 
-        # шапка
+    try:
+        # Заголовки
         sheet.format(
             f"A1:L1",
             {
                 "textFormat": {"bold": True},
                 "horizontalAlignment": "CENTER"
+            }
+        )
+
+        # Числовой формат для цен
+        sheet.format(
+            f"G2:I{last_row}",
+            {
+                "numberFormat": {
+                    "type": "NUMBER",
+                    "pattern": "0.0000"
+                }
+            }
+        )
+
+        # Проценты
+        sheet.format(
+            f"J2:K{last_row}",
+            {
+                "numberFormat": {
+                    "type": "PERCENT",
+                    "pattern": "0.00%"
+                }
             }
         )
     except Exception as e:
@@ -340,7 +352,7 @@ def apply_formatting(sheet, row_count: int):
 def rewrite_sheet(sheet, rows):
     values = [HEADERS] + rows
     sheet.clear()
-    sheet.update(values, "A1", value_input_option="USER_ENTERED")
+    sheet.update("A1:L" + str(len(values)), values, value_input_option="USER_ENTERED")
     apply_formatting(sheet, len(values))
     logging.info("Sheet updated with %s rows", len(rows))
 
