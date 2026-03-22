@@ -1,3 +1,4 @@
+cat > news_bot.py <<'EOF'
 import os
 import asyncio
 import html
@@ -97,11 +98,11 @@ def normalize_ratio(text: str) -> str:
 
 
 def extract_ticker(text: str) -> str:
-    m = re.search(r"\(([A-Z]{1,5})\)", text)
+    m = re.search(r"\(([A-Z]{1,8})\)", text)
     if m:
         return m.group(1)
 
-    m = re.search(r"\b([A-Z]{1,5})\b", text)
+    m = re.search(r"\b([A-Z]{1,8})\b", text)
     if m:
         return m.group(1)
 
@@ -116,6 +117,33 @@ async def fetch_article_text(client: httpx.AsyncClient, url: str) -> str:
     except Exception as e:
         logging.warning("Article fetch failed %s: %s", url, e)
         return ""
+
+
+async def get_price(ticker: str) -> str:
+    if not ticker or ticker == "N/A":
+        return "N/A"
+
+    url = "https://query1.finance.yahoo.com/v7/finance/quote"
+    params = {"symbols": ticker}
+
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+            r = await client.get(url, params=params)
+            r.raise_for_status()
+            data = r.json()
+
+        result = data.get("quoteResponse", {}).get("result", [])
+        if not result:
+            return "N/A"
+
+        price = result[0].get("regularMarketPrice")
+        if price is None:
+            return "N/A"
+
+        return f"${price:.2f}"
+    except Exception as e:
+        logging.warning("Price fetch failed for %s: %s", ticker, e)
+        return "N/A"
 
 
 async def scan_feed(client: httpx.AsyncClient, source_name: str, url: str) -> list[dict]:
@@ -151,9 +179,13 @@ async def scan_feed(client: httpx.AsyncClient, source_name: str, url: str) -> li
         if not ratio:
             continue
 
+        ticker = extract_ticker(text)
+        price = await get_price(ticker)
+
         results.append(
             {
-                "ticker": extract_ticker(text),
+                "ticker": ticker,
+                "price": price,
                 "ratio": ratio,
                 "title": title,
                 "link": link,
@@ -177,12 +209,12 @@ async def fetch_news() -> list[dict]:
         result.extend(chunk)
 
     deduped = []
-    seen = set()
+    seen_local = set()
     for item in result:
         key = (item["ticker"], item["ratio"], item["link"])
-        if key in seen:
+        if key in seen_local:
             continue
-        seen.add(key)
+        seen_local.add(key)
         deduped.append(item)
 
     return deduped
@@ -192,6 +224,7 @@ def format_alert(item: dict) -> str:
     return (
         "🚨 REVERSE SPLIT NEWS\n\n"
         f"Ticker: {item['ticker']}\n"
+        f"Price: {item['price']}\n"
         f"Ratio: {item['ratio']}\n"
         f"Source: {item['source']}\n\n"
         f"{item['title']}\n"
@@ -231,3 +264,4 @@ async def loop() -> None:
 
 if __name__ == "__main__":
     asyncio.run(loop())
+EOF
