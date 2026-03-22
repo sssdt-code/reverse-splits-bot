@@ -176,7 +176,7 @@ async def get_price_now(ticker: str) -> str:
     params = {"symbols": ticker}
 
     try:
-        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
             r = await client.get(url, params=params)
             r.raise_for_status()
             data = r.json()
@@ -220,7 +220,7 @@ async def get_history_prices(ticker: str, ref_date_str: str) -> tuple[str, str]:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
             r = await client.get(url, params=params)
             r.raise_for_status()
             data = r.json()
@@ -268,9 +268,15 @@ async def get_history_prices(ticker: str, ref_date_str: str) -> tuple[str, str]:
 
 async def build_rows(items: list[dict]) -> list[list[str]]:
     rows = []
-    for item in items:
-        close_14d, close_pre = await get_history_prices(item["ticker"], item["announcement_date"])
-        price_now = await get_price_now(item["ticker"])
+
+    for index, item in enumerate(items, start=1):
+        ticker = item["ticker"]
+
+        close_14d, close_pre = await get_history_prices(ticker, item["announcement_date"])
+        await asyncio.sleep(1.5)
+
+        price_now = await get_price_now(ticker)
+        await asyncio.sleep(1.5)
 
         rows.append([
             item["ticker"],
@@ -284,6 +290,12 @@ async def build_rows(items: list[dict]) -> list[list[str]]:
             price_now,
             item["source"],
         ])
+
+        logging.info(
+            "Prepared row %s/%s for %s | close_14d=%s close_pre=%s price_now=%s",
+            index, len(items), ticker, close_14d, close_pre, price_now
+        )
+
     return rows
 
 
