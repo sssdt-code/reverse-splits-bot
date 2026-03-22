@@ -217,35 +217,15 @@ async def fetch_splits():
         return rows
 
 
-async def twelve_price(client: httpx.AsyncClient, ticker: str):
+async def twelve_series(client: httpx.AsyncClient, ticker: str, announcement_date: str):
     try:
-        r = await client.get(
-            "https://api.twelvedata.com/price",
-            params={"symbol": ticker, "apikey": TWELVE_API_KEY},
-            timeout=15,
-        )
-        data = r.json()
-        price = data.get("price")
-        if price in (None, "", "null"):
-            return None
-        return float(price)
-    except Exception as e:
-        logging.warning("Price failed for %s: %s", ticker, e)
-        return None
+        if announcement_date:
+            ann_dt = datetime.strptime(announcement_date, "%Y-%m-%d")
+        else:
+            ann_dt = datetime.utcnow()
 
-
-async def twelve_history(client: httpx.AsyncClient, ticker: str, announcement_date: str):
-    if not announcement_date:
-        return None, None
-
-    try:
-        ann_dt = datetime.strptime(announcement_date, "%Y-%m-%d")
-    except Exception:
-        return None, None
-
-    try:
-        start = (ann_dt - timedelta(days=25)).date()
-        end = ann_dt.date()
+        start = (ann_dt - timedelta(days=30)).date()
+        end = datetime.utcnow().date()
 
         r = await client.get(
             "https://api.twelvedata.com/time_series",
@@ -254,7 +234,7 @@ async def twelve_history(client: httpx.AsyncClient, ticker: str, announcement_da
                 "interval": "1day",
                 "start_date": str(start),
                 "end_date": str(end),
-                "outputsize": 40,
+                "outputsize": 60,
                 "apikey": TWELVE_API_KEY,
             },
             timeout=20,
@@ -262,7 +242,7 @@ async def twelve_history(client: httpx.AsyncClient, ticker: str, announcement_da
         data = r.json()
         values = data.get("values", [])
         if not values:
-            return None, None
+            return None, None, None
 
         parsed = []
         for row in values:
@@ -277,9 +257,11 @@ async def twelve_history(client: httpx.AsyncClient, ticker: str, announcement_da
                 continue
 
         if not parsed:
-            return None, None
+            return None, None, None
 
         parsed.sort(key=lambda x: x[0])
+
+        price_now = parsed[-1][1]
 
         close_pre = None
         pre_candidates = [p for d, p in parsed if d < ann_dt]
@@ -294,11 +276,11 @@ async def twelve_history(client: httpx.AsyncClient, ticker: str, announcement_da
         elif pre_candidates:
             close_14d = pre_candidates[0]
 
-        return close_14d, close_pre
+        return price_now, close_pre, close_14d
 
     except Exception as e:
-        logging.warning("History failed for %s: %s", ticker, e)
-        return None, None
+        logging.warning("Time series failed for %s: %s", ticker, e)
+        return None, None, None
 
 
 async def enrich_rows(rows):
@@ -307,11 +289,7 @@ async def enrich_rows(rows):
             ticker = row[0]
             announcement_date = row[2]
 
-            close_14d, close_pre = await twelve_history(client, ticker, announcement_date)
-            await asyncio.sleep(0.35)
-
-            price_now = await twelve_price(client, ticker)
-            await asyncio.sleep(0.65)
+            price_now, close_pre, close_14d = await twelve_series(client, ticker, announcement_date)
 
             row[6] = f"{close_14d:.4f}" if close_14d is not None else "N/A"
             row[7] = f"{close_pre:.4f}" if close_pre is not None else "N/A"
@@ -322,13 +300,15 @@ async def enrich_rows(rows):
                 i, len(rows), ticker, row[6], row[7], row[8]
             )
 
+            await asyncio.sleep(0.8)
+
     return rows
 
 
 def rewrite_sheet(sheet, rows):
     values = [HEADERS] + rows
     sheet.clear()
-    sheet.update("A1", values)
+    sheet.update(values, "A1")
     logging.info("Sheet updated with %s rows", len(rows))
 
 
