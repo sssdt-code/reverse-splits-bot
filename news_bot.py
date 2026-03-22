@@ -5,7 +5,7 @@ import asyncio
 import html
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 import feedparser
@@ -126,6 +126,25 @@ def extract_ticker(text: str) -> str:
     return "N/A"
 
 
+def extract_split_date(text: str) -> str:
+    patterns = [
+        r"effective on or about ([A-Z][a-z]+ \d{1,2}, \d{4})",
+        r"effective on ([A-Z][a-z]+ \d{1,2}, \d{4})",
+        r"effective date(?: is)? ([A-Z][a-z]+ \d{1,2}, \d{4})",
+        r"expected to be effective on ([A-Z][a-z]+ \d{1,2}, \d{4})",
+        r"commence trading on ([A-Z][a-z]+ \d{1,2}, \d{4})",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            raw = m.group(1)
+            try:
+                return datetime.strptime(raw, "%B %d, %Y").strftime("%Y-%m-%d")
+            except ValueError:
+                return raw
+    return "N/A"
+
+
 async def fetch_article_text(client: httpx.AsyncClient, url: str) -> str:
     try:
         r = await client.get(url, timeout=20, follow_redirects=True)
@@ -136,7 +155,7 @@ async def fetch_article_text(client: httpx.AsyncClient, url: str) -> str:
         return ""
 
 
-async def get_price(ticker: str) -> str:
+async def get_price_now(ticker: str) -> str:
     if not ticker or ticker == "N/A":
         return "N/A"
 
@@ -157,10 +176,82 @@ async def get_price(ticker: str) -> str:
         if price is None:
             return "N/A"
 
-        return f"${price:.2f}"
+        return f"{price:.2f}"
     except Exception as e:
-        logging.warning("Price fetch failed for %s: %s", ticker, e)
+        logging.warning("Price now fetch failed for %s: %s", ticker, e)
         return "N/A"
+
+
+async def get_history_prices(ticker: str, news_dt: datetime) -> tuple[str, str]:
+    """
+    Returns:
+    - close_14d: close 14 calendar days before news date (nearest previous available close)
+    - close_pre: last close before news timestamp
+    """
+    if not ticker or ticker == "N/A":
+        return "N/A", "N/A"
+
+    start_dt = news_dt - timedelta(days=25)
+    end_dt = news_dt + timedelta(days=2)
+
+    period1 = int(start_dt.replace(tzinfo=timezone.utc).timestamp())
+    period2 = int(end_dt.replace(tzinfo=timezone.utc).timestamp())
+
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    params = {
+        "period1": str(period1),
+        "period2": str(period2),
+        "interval": "1d",
+        "includePrePost": "false",
+        "events": "div,splits",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            r = await client.get(url, params=params)
+            r.raise_for_status()
+            data = r.json()
+
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return "N/A", "N/A"
+
+        timestamps = result[0].get("timestamp", [])
+        quote = result[0].get("indicators", {}).get("quote", [{}])[0]
+        closes = quote.get("close", [])
+
+        rows = []
+        for ts, close in zip(timestamps, closes):
+            if close is None:
+                continue
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            rows.append((dt, float(close)))
+
+        if not rows:
+            return "N/A", "N/A"
+
+        target_14d = news_dt - timedelta(days=14)
+
+        close_pre = "N/A"
+        pre_candidates = [price for dt, price in rows if dt < news_dt]
+        if pre_candidates:
+            close_pre = f"{pre_candidates[-1]:.2f}"
+
+        close_14d = "N/A"
+        hist_candidates = [(dt, price) for dt, price in rows if dt <= target_14d]
+        if hist_candidates:
+            close_14d = f"{hist_candidates[-1][1]:.2f}"
+        else:
+            # fallback: nearest earliest available before news
+            earlier = [(dt, price) for dt, price in rows if dt < news_dt]
+            if earlier:
+                close_14d = f"{earlier[0][1]:.2f}"
+
+        return close_14d, close_pre
+
+    except Exception as e:
+        logging.warning("History fetch failed for %s: %s", ticker, e)
+        return "N/A", "N/A"
 
 
 def ensure_csv_exists() -> None:
@@ -169,7 +260,18 @@ def ensure_csv_exists() -> None:
 
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["Date", "Ticker", "Ratio", "Type", "Company", "Price"])
+        writer.writerow([
+            "Ticker",
+            "Company",
+            "News Date",
+            "Split Date",
+            "Ratio",
+            "Close -14D",
+            "Close Pre",
+            "Price Now",
+            "Type",
+            "Source",
+        ])
 
 
 def write_to_csv(item: dict) -> None:
@@ -178,12 +280,16 @@ def write_to_csv(item: dict) -> None:
     with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             item.get("ticker", ""),
+            item.get("company", ""),
+            item.get("news_date", ""),
+            item.get("split_date", ""),
             item.get("ratio", ""),
+            item.get("close_14d", "N/A"),
+            item.get("close_pre", "N/A"),
+            item.get("price_now", "N/A"),
             get_split_type(item.get("ratio", "")),
-            item.get("title", ""),
-            item.get("price", "N/A"),
+            item.get("source", ""),
         ])
 
 
@@ -198,14 +304,23 @@ async def scan_feed(client: httpx.AsyncClient, source_name: str, url: str) -> li
         link = entry.get("link", "")
 
         published_raw = entry.get("published") or entry.get("updated") or ""
+        news_dt = None
+        news_date_str = "N/A"
+
         if published_raw:
             try:
                 pub = parsedate_to_datetime(published_raw)
-                pub_naive = pub.replace(tzinfo=None) if pub.tzinfo else pub
+                news_dt = pub.astimezone(timezone.utc) if pub.tzinfo else pub.replace(tzinfo=timezone.utc)
+                pub_naive = news_dt.replace(tzinfo=None)
                 if pub_naive < cutoff:
                     continue
+                news_date_str = news_dt.strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
-                pass
+                news_dt = None
+
+        if news_dt is None:
+            news_dt = datetime.now(timezone.utc)
+            news_date_str = news_dt.strftime("%Y-%m-%d %H:%M:%S")
 
         text = f"{title}\n{summary}"
 
@@ -221,13 +336,20 @@ async def scan_feed(client: httpx.AsyncClient, source_name: str, url: str) -> li
             continue
 
         ticker = extract_ticker(text)
-        price = await get_price(ticker)
+        price_now = await get_price_now(ticker)
+        close_14d, close_pre = await get_history_prices(ticker, news_dt)
+        split_date = extract_split_date(text)
 
         results.append(
             {
                 "ticker": ticker,
-                "price": price,
+                "company": title,
+                "news_date": news_date_str,
+                "split_date": split_date,
                 "ratio": ratio,
+                "close_14d": close_14d,
+                "close_pre": close_pre,
+                "price_now": price_now,
                 "title": title,
                 "link": link,
                 "source": source_name,
@@ -265,8 +387,12 @@ def format_alert(item: dict) -> str:
     return (
         "🚨 REVERSE SPLIT NEWS\n\n"
         f"Ticker: {item['ticker']}\n"
-        f"Price: {item['price']}\n"
+        f"Price Now: {item['price_now']}\n"
+        f"Close Pre: {item['close_pre']}\n"
+        f"Close -14D: {item['close_14d']}\n"
         f"Ratio: {item['ratio']}\n"
+        f"News Date: {item['news_date']}\n"
+        f"Split Date: {item['split_date']}\n"
         f"Source: {item['source']}\n\n"
         f"{item['title']}\n"
         f"{item['link']}"
