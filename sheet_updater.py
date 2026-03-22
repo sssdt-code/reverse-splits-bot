@@ -202,7 +202,7 @@ async def build_rows(items: list[dict]) -> list[list[str]]:
         ticker = item["ticker"]
 
         price_now = await get_price_now(ticker)
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(6.0)
 
         rows.append([
             item["ticker"],
