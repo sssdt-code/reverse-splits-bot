@@ -107,11 +107,9 @@ def looks_like_ticker(value: str) -> bool:
 def is_good_stock(ticker: str, company: str, exchange: str) -> bool:
     if exchange in EXCLUDED_EXCHANGES:
         return False
-
     upper_name = (company or "").upper()
     if any(word in upper_name for word in BAD_COMPANY_WORDS):
         return False
-
     return True
 
 
@@ -188,12 +186,12 @@ def parse_benzinga_html(html_text: str):
             split_date,
             ratio,
             exchange,
-            "N/A",  # Close -14D
-            "N/A",  # Close Pre
-            "N/A",  # Price Now
-            "N/A",  # % vs Close -14D
-            "N/A",  # % vs Close Pre
-            "Benzinga",
+            "N/A",  # G
+            "N/A",  # H
+            "N/A",  # I
+            "",     # J formula
+            "",     # K formula
+            "Benzinga",  # L
         ])
 
     dedup = []
@@ -223,10 +221,7 @@ async def fetch_splits():
 
 async def twelve_series(client: httpx.AsyncClient, ticker: str, announcement_date: str):
     try:
-        if announcement_date:
-            ann_dt = datetime.strptime(announcement_date, "%Y-%m-%d")
-        else:
-            ann_dt = datetime.utcnow()
+        ann_dt = datetime.strptime(announcement_date, "%Y-%m-%d") if announcement_date else datetime.utcnow()
 
         start = (ann_dt - timedelta(days=30)).date()
         end = datetime.utcnow().date()
@@ -287,14 +282,6 @@ async def twelve_series(client: httpx.AsyncClient, ticker: str, announcement_dat
         return None, None, None
 
 
-def pct_change(current, base):
-    if current is None or base is None:
-        return None
-    if base == 0:
-        return None
-    return ((current / base) - 1.0) * 100.0
-
-
 async def enrich_rows(rows):
     async with httpx.AsyncClient() as client:
         for i, row in enumerate(rows, start=1):
@@ -303,18 +290,21 @@ async def enrich_rows(rows):
 
             price_now, close_pre, close_14d = await twelve_series(client, ticker, announcement_date)
 
-            pct_vs_14d = pct_change(price_now, close_14d)
-            pct_vs_pre = pct_change(price_now, close_pre)
-
             row[6] = f"{close_14d:.4f}" if close_14d is not None else "N/A"
             row[7] = f"{close_pre:.4f}" if close_pre is not None else "N/A"
             row[8] = f"{price_now:.4f}" if price_now is not None else "N/A"
-            row[9] = f"{pct_vs_14d:.2f}%" if pct_vs_14d is not None else "N/A"
-            row[10] = f"{pct_vs_pre:.2f}%" if pct_vs_pre is not None else "N/A"
+
+            sheet_row = i + 1  # because header is row 1
+
+            # J = % vs Close -14D
+            row[9] = f'=IF(OR(G{sheet_row}="N/A";I{sheet_row}="N/A";G{sheet_row}=0);"";I{sheet_row}/G{sheet_row}-1)'
+
+            # K = % vs Close Pre
+            row[10] = f'=IF(OR(H{sheet_row}="N/A";I{sheet_row}="N/A";H{sheet_row}=0);"";I{sheet_row}/H{sheet_row}-1)'
 
             logging.info(
-                "Prepared row %s/%s for %s | close_14d=%s close_pre=%s price_now=%s pct14=%s pctpre=%s",
-                i, len(rows), ticker, row[6], row[7], row[8], row[9], row[10]
+                "Prepared row %s/%s for %s | close_14d=%s close_pre=%s price_now=%s",
+                i, len(rows), ticker, row[6], row[7], row[8]
             )
 
             await asyncio.sleep(0.8)
@@ -322,10 +312,36 @@ async def enrich_rows(rows):
     return rows
 
 
+def apply_formatting(sheet, row_count: int):
+    try:
+        # проценты в J:K
+        sheet.format(
+            f"J2:K{row_count}",
+            {
+                "numberFormat": {
+                    "type": "PERCENT",
+                    "pattern": "0.00%"
+                }
+            }
+        )
+
+        # шапка
+        sheet.format(
+            f"A1:L1",
+            {
+                "textFormat": {"bold": True},
+                "horizontalAlignment": "CENTER"
+            }
+        )
+    except Exception as e:
+        logging.warning("Formatting skipped: %s", e)
+
+
 def rewrite_sheet(sheet, rows):
     values = [HEADERS] + rows
     sheet.clear()
-    sheet.update(values, "A1")
+    sheet.update(values, "A1", value_input_option="USER_ENTERED")
+    apply_formatting(sheet, len(values))
     logging.info("Sheet updated with %s rows", len(rows))
 
 
