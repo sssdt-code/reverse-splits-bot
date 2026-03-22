@@ -30,6 +30,8 @@ HEADERS = [
     "Close -14D",
     "Close Pre",
     "Price Now",
+    "% vs Close -14D",
+    "% vs Close Pre",
     "Source",
 ]
 
@@ -186,9 +188,11 @@ def parse_benzinga_html(html_text: str):
             split_date,
             ratio,
             exchange,
-            "N/A",
-            "N/A",
-            "N/A",
+            "N/A",  # Close -14D
+            "N/A",  # Close Pre
+            "N/A",  # Price Now
+            "N/A",  # % vs Close -14D
+            "N/A",  # % vs Close Pre
             "Benzinga",
         ])
 
@@ -283,6 +287,14 @@ async def twelve_series(client: httpx.AsyncClient, ticker: str, announcement_dat
         return None, None, None
 
 
+def pct_change(current, base):
+    if current is None or base is None:
+        return None
+    if base == 0:
+        return None
+    return ((current / base) - 1.0) * 100.0
+
+
 async def enrich_rows(rows):
     async with httpx.AsyncClient() as client:
         for i, row in enumerate(rows, start=1):
@@ -291,13 +303,18 @@ async def enrich_rows(rows):
 
             price_now, close_pre, close_14d = await twelve_series(client, ticker, announcement_date)
 
+            pct_vs_14d = pct_change(price_now, close_14d)
+            pct_vs_pre = pct_change(price_now, close_pre)
+
             row[6] = f"{close_14d:.4f}" if close_14d is not None else "N/A"
             row[7] = f"{close_pre:.4f}" if close_pre is not None else "N/A"
             row[8] = f"{price_now:.4f}" if price_now is not None else "N/A"
+            row[9] = f"{pct_vs_14d:.2f}%" if pct_vs_14d is not None else "N/A"
+            row[10] = f"{pct_vs_pre:.2f}%" if pct_vs_pre is not None else "N/A"
 
             logging.info(
-                "Prepared row %s/%s for %s | close_14d=%s close_pre=%s price_now=%s",
-                i, len(rows), ticker, row[6], row[7], row[8]
+                "Prepared row %s/%s for %s | close_14d=%s close_pre=%s price_now=%s pct14=%s pctpre=%s",
+                i, len(rows), ticker, row[6], row[7], row[8], row[9], row[10]
             )
 
             await asyncio.sleep(0.8)
